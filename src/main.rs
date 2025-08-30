@@ -728,7 +728,7 @@ async fn handle_client(
 
                         // Handle resize if detected
                         if let Some(resize) = resize_data {
-                            tracing::debug!("Detected window resize: {}x{}", resize.cols, resize.rows);
+                            tracing::info!("Detected window resize: {}x{}", resize.rows, resize.cols);
 
                             // Apply new window size to PTY
                             if let Err(e) = apply_window_size_to_pty(pty_async.get_ref().as_raw_fd(), resize.rows, resize.cols) {
@@ -805,10 +805,6 @@ async fn handle_client(
 
 // CLIENT LOGIC
 async fn client_main(detach_char: u8) -> Result<()> {
-    // Initialize signal manager for client mode
-    let signal_manager = SignalManager::new(true);
-    signal_manager.setup_client_signals()?;
-
     // Initialize terminal state
     let mut terminal_state = TerminalState::new()?;
     if !terminal_state.is_terminal_available() {
@@ -840,39 +836,51 @@ async fn client_main(detach_char: u8) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
+    // Create tokio signal handlers
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
     // Enhanced client loop with signal handling
     let mut stdin_buf = [0u8; 1024];
     let mut server_buf = [0u8; 1024];
 
     loop {
-        // Check for window size changes
-        if signal_manager.check_window_changed() {
-            let new_size = get_terminal_size();
-            if window_manager.update_size(new_size) {
-                tracing::debug!("Window size changed: {}x{}", new_size.cols, new_size.rows);
-
-                // Send window resize escape sequence to server
-                let resize_seq = format!("\x1b[8;{};{}t", new_size.rows, new_size.cols);
-                if let Err(e) = server_writer.write_all(resize_seq.as_bytes()).await {
-                    tracing::error!("Failed to send window resize to server: {}", e);
-                    break;
-                }
-                if let Err(e) = server_writer.flush().await {
-                    tracing::error!("Failed to flush resize sequence: {}", e);
-                    break;
-                }
-            }
-        }
-
-        // Check for shutdown signal
-        if signal_manager.check_shutdown_requested() {
-            if let Some(sig) = signal_manager.get_shutdown_signal() {
-                tracing::info!("Received shutdown signal: {:?}", sig);
-            }
-            break;
-        }
-
         tokio::select! {
+            // Handle SIGWINCH directly
+            _ = sigwinch.recv() => {
+                let new_size = get_terminal_size();
+                if window_manager.update_size(new_size) {
+                    tracing::debug!("Window size changed: {}x{}", new_size.cols, new_size.rows);
+
+                    // Send window resize escape sequence to server
+                    let resize_seq = format!("\x1b[8;{};{}t", new_size.rows, new_size.cols);
+                    if let Err(e) = server_writer.write_all(resize_seq.as_bytes()).await {
+                        tracing::error!("Failed to send window resize to server: {}", e);
+                        break;
+                    }
+                    if let Err(e) = server_writer.flush().await {
+                        tracing::error!("Failed to flush resize sequence: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Handle shutdown signals directly
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM");
+                break;
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT");
+                break;
+            }
+            _ = sighup.recv() => {
+                tracing::info!("Received SIGHUP");
+                break;
+            }
             // Handle keyboard input
             result = stdin.read(&mut stdin_buf) => {
                 match result {
