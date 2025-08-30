@@ -16,9 +16,11 @@ use tokio::sync::{Mutex, broadcast};
 const SOCKET_PATH: &str = "/tmp/term-replay.sock";
 const LOG_PATH: &str = "/tmp/term-replay.log";
 const DEBUG_RAW_LOG_PATH: &str = "/tmp/term-replay-raw.log";
+const INPUT_LOG_PATH: &str = "/tmp/term-replay-input.log";
 
 // Debug flag - set to true to enable raw logging
 const DEBUG_RAW_LOGGING: bool = true;
+const INPUT_LOGGING: bool = true;
 
 // Terminal mode tracking
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -194,6 +196,9 @@ async fn server_main() -> Result<()> {
     if DEBUG_RAW_LOGGING && Path::new(DEBUG_RAW_LOG_PATH).exists() {
         std::fs::remove_file(DEBUG_RAW_LOG_PATH)?;
     }
+    if INPUT_LOGGING && Path::new(INPUT_LOG_PATH).exists() {
+        std::fs::remove_file(INPUT_LOG_PATH)?;
+    }
 
     // 1. Create the Pseudo-Terminal (PTY)
     // This is a synchronous, low-level call.
@@ -254,6 +259,19 @@ async fn server_main() -> Result<()> {
                 .create(true)
                 .append(true)
                 .open(DEBUG_RAW_LOG_PATH)
+                .await?,
+        )))
+    } else {
+        None
+    };
+
+    // Input log file (logs client-to-PTY data)
+    let input_log = if INPUT_LOGGING {
+        Some(Arc::new(Mutex::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(INPUT_LOG_PATH)
                 .await?,
         )))
     } else {
@@ -377,10 +395,11 @@ async fn server_main() -> Result<()> {
         let (stream, _) = listener.accept().await?;
         tracing::info!("New client connected");
         let pty_async_clone = pty_async.clone();
+        let input_log_clone = input_log.clone();
         let mut rx = tx.subscribe();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, pty_async_clone, &mut rx).await {
+            if let Err(e) = handle_client(stream, pty_async_clone, input_log_clone, &mut rx).await {
                 tracing::warn!("Client disconnected with error: {}", e);
             } else {
                 tracing::info!("Client disconnected gracefully.");
@@ -393,6 +412,7 @@ async fn server_main() -> Result<()> {
 async fn handle_client(
     stream: UnixStream,
     pty_async: Arc<AsyncFd<RawFd>>,
+    input_log: Option<Arc<Mutex<TokioFile>>>,
     rx: &mut broadcast::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
@@ -410,6 +430,16 @@ async fn handle_client(
                 match result {
                     Ok(0) => break, // Client disconnected
                     Ok(n) => {
+                        let input_data = &client_buf[..n];
+
+                        // Log input data (client-to-PTY)
+                        if let Some(input_log) = &input_log {
+                            let mut log = input_log.lock().await;
+                            if let Err(e) = log.write_all(input_data).await {
+                                tracing::error!("Failed to write to input log: {}", e);
+                            }
+                        }
+
                         let mut guard = pty_async.writable().await.unwrap();
                         match guard.try_io(|inner| {
                             let fd = inner.as_raw_fd();
