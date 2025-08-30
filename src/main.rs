@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use nix::pty::{forkpty, ForkptyResult};
-use nix::unistd::{self, ForkResult};
+use nix::unistd;
 use std::ffi::CString;
 use std::os::unix::io::{FromRawFd, AsRawFd};
 use std::path::Path;
@@ -93,7 +93,8 @@ async fn server_main() -> Result<()> {
                     let data = buf[..n].to_vec();
                     
                     // a. Write to the log file
-                    if let Ok(mut log) = log_file.lock().await {
+                    {
+                        let mut log = log_file.lock().await;
                         if let Err(e) = log.write_all(&data).await {
                             tracing::error!("Failed to write to log: {}", e);
                         }
