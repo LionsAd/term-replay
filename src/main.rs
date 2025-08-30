@@ -41,32 +41,201 @@ fn parse_detach_char(detach_str: &str) -> Result<u8> {
 }
 
 /// Window resize data
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct WindowResizeData {
     rows: u16,
     cols: u16,
 }
 
-/// Detect window resize escape sequence: \x1b[8;rows;colst
-fn detect_window_resize_sequence(data: &[u8]) -> Option<WindowResizeData> {
-    let data_str = std::str::from_utf8(data).ok()?;
+/// State machine for parsing input and detecting resize sequences
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InputParseState {
+    Normal,
+    Escape,        // Saw ESC (\x1b)
+    Csi,           // Saw ESC [
+    Csi8,          // Saw ESC [ 8
+    Csi8Semicolon, // Saw ESC [ 8 ;
+    Rows,          // Parsing row digits
+    RowsSemicolon, // Saw semicolon after rows
+    Cols,          // Parsing column digits
+}
 
-    // Look for the pattern: ESC[8;rows;cols;t
-    if data_str.starts_with("\x1b[8;") && data_str.ends_with('t') {
-        // Extract the middle part: "rows;cols"
-        let content = &data_str[4..data_str.len() - 1]; // Remove "\x1b[8;" and "t"
-        let parts: Vec<&str> = content.split(';').collect();
+/// Input parser for detecting resize sequences
+struct InputParser {
+    state: InputParseState,
+    sequence_buffer: Vec<u8>,
+    rows_str: String,
+    cols_str: String,
+}
 
-        if parts.len() == 2 {
-            if let (Ok(rows), Ok(cols)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
-                if rows > 0 && cols > 0 {
-                    return Some(WindowResizeData { rows, cols });
+impl InputParser {
+    fn new() -> Self {
+        Self {
+            state: InputParseState::Normal,
+            sequence_buffer: Vec::new(),
+            rows_str: String::new(),
+            cols_str: String::new(),
+        }
+    }
+
+    /// Process input bytes and extract any complete resize sequences
+    /// Returns (data_to_forward, optional_resize_data)
+    fn process_bytes(&mut self, input: &[u8]) -> (Vec<u8>, Option<WindowResizeData>) {
+        let mut output = Vec::new();
+        let mut resize_data = None;
+
+        for &byte in input {
+            match self.process_byte(byte) {
+                InputAction::Forward(b) => output.push(b),
+                InputAction::ForwardSequence => {
+                    // Invalid sequence, forward the accumulated buffer
+                    output.extend_from_slice(&self.sequence_buffer);
+                    self.reset();
                 }
+                InputAction::ResizeDetected(data) => {
+                    // Take the first resize sequence found
+                    if resize_data.is_none() {
+                        resize_data = Some(data);
+                    }
+                    self.reset();
+                }
+                InputAction::Continue => {
+                    // Continue accumulating sequence
+                }
+            }
+        }
+
+        (output, resize_data)
+    }
+
+    fn process_byte(&mut self, byte: u8) -> InputAction {
+        match (self.state, byte) {
+            // Normal state: scan for ESC
+            (InputParseState::Normal, 0x1b) => {
+                self.state = InputParseState::Escape;
+                self.sequence_buffer.clear();
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Normal, b) => InputAction::Forward(b),
+
+            // Escape state: look for [
+            (InputParseState::Escape, b'[') => {
+                self.state = InputParseState::Csi;
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Escape, _) => {
+                // Not a CSI sequence, forward ESC and current byte
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
+            }
+
+            // CSI state: look for 8
+            (InputParseState::Csi, b'8') => {
+                self.state = InputParseState::Csi8;
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Csi, _) => {
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
+            }
+
+            // CSI8 state: look for ;
+            (InputParseState::Csi8, b';') => {
+                self.state = InputParseState::Csi8Semicolon;
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Csi8, _) => {
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
+            }
+
+            // CSI8; state: start collecting row digits
+            (InputParseState::Csi8Semicolon, b'0'..=b'9') => {
+                self.state = InputParseState::Rows;
+                self.rows_str.clear();
+                self.rows_str.push(byte as char);
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Csi8Semicolon, _) => {
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
+            }
+
+            // Rows state: collect more digits or semicolon
+            (InputParseState::Rows, b'0'..=b'9') => {
+                self.rows_str.push(byte as char);
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Rows, b';') => {
+                self.state = InputParseState::RowsSemicolon;
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Rows, _) => {
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
+            }
+
+            // Rows; state: start collecting column digits
+            (InputParseState::RowsSemicolon, b'0'..=b'9') => {
+                self.state = InputParseState::Cols;
+                self.cols_str.clear();
+                self.cols_str.push(byte as char);
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::RowsSemicolon, _) => {
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
+            }
+
+            // Cols state: collect more digits or 't'
+            (InputParseState::Cols, b'0'..=b'9') => {
+                self.cols_str.push(byte as char);
+                self.sequence_buffer.push(byte);
+                InputAction::Continue
+            }
+            (InputParseState::Cols, b't') => {
+                // Complete sequence! Parse the dimensions
+                if let (Ok(rows), Ok(cols)) =
+                    (self.rows_str.parse::<u16>(), self.cols_str.parse::<u16>())
+                {
+                    if rows > 0 && cols > 0 {
+                        return InputAction::ResizeDetected(WindowResizeData { rows, cols });
+                    }
+                }
+                // Invalid dimensions, forward the sequence including 't'
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
+            }
+            (InputParseState::Cols, _) => {
+                // Invalid ending, forward sequence including this byte
+                self.sequence_buffer.push(byte);
+                InputAction::ForwardSequence
             }
         }
     }
 
-    None
+    fn reset(&mut self) {
+        self.state = InputParseState::Normal;
+        self.sequence_buffer.clear();
+        self.rows_str.clear();
+        self.cols_str.clear();
+    }
+}
+
+/// Actions to take when processing input bytes
+enum InputAction {
+    Forward(u8),                      // Forward this byte normally
+    ForwardSequence,                  // Forward accumulated sequence buffer
+    ResizeDetected(WindowResizeData), // Complete resize sequence detected
+    Continue,                         // Continue accumulating sequence
 }
 
 /// Apply window size to PTY file descriptor
@@ -536,6 +705,9 @@ async fn handle_client(
 ) -> Result<()> {
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
 
+    // Initialize input parser for this client
+    let mut input_parser = InputParser::new();
+
     // a. Replay history
     let mut history_file = TokioFile::open(LOG_PATH).await?;
     tokio::io::copy(&mut history_file, &mut client_writer).await?;
@@ -551,55 +723,59 @@ async fn handle_client(
                     Ok(n) => {
                         let input_data = &client_buf[..n];
 
-                        // Check for window resize escape sequence
-                        if let Some(resize_data) = detect_window_resize_sequence(input_data) {
-                            tracing::debug!("Detected window resize: {}x{}", resize_data.cols, resize_data.rows);
+                        // Process input through state machine to detect resize sequences
+                        let (data_to_forward, resize_data) = input_parser.process_bytes(input_data);
+
+                        // Handle resize if detected
+                        if let Some(resize) = resize_data {
+                            tracing::debug!("Detected window resize: {}x{}", resize.cols, resize.rows);
 
                             // Apply new window size to PTY
-                            if let Err(e) = apply_window_size_to_pty(pty_async.get_ref().as_raw_fd(), resize_data.rows, resize_data.cols) {
+                            if let Err(e) = apply_window_size_to_pty(pty_async.get_ref().as_raw_fd(), resize.rows, resize.cols) {
                                 tracing::warn!("Failed to apply window size to PTY: {}", e);
                             }
-
-                            // Don't forward resize sequence to PTY, but continue processing
-                            continue;
                         }
 
-                        // Log input data (client-to-PTY) - but not resize sequences
-                        if let Some(input_log) = &input_log {
-                            let mut log = input_log.lock().await;
-                            if let Err(e) = log.write_all(input_data).await {
-                                tracing::error!("Failed to write to input log: {}", e);
-                            }
-                        }
-
-                        let mut guard = pty_async.writable().await.unwrap();
-                        match guard.try_io(|inner| {
-                            let fd = inner.as_raw_fd();
-                            unsafe {
-                                let result = libc::write(fd, client_buf[..n].as_ptr() as *const libc::c_void, n);
-                                if result == -1 {
-                                    let errno = *libc::__error();
-                                    if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                                        return Err(std::io::Error::from_raw_os_error(errno));
-                                    } else {
-                                        return Err(std::io::Error::from_raw_os_error(errno));
-                                    }
+                        // Only forward and log non-resize data
+                        if !data_to_forward.is_empty() {
+                            // Log input data (client-to-PTY) - excluding resize sequences
+                            if let Some(input_log) = &input_log {
+                                let mut log = input_log.lock().await;
+                                if let Err(e) = log.write_all(&data_to_forward).await {
+                                    tracing::error!("Failed to write to input log: {}", e);
                                 }
-                                Ok(result as usize)
                             }
-                        }) {
-                            Ok(Ok(_)) => {}, // Write successful
-                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // Retry later
-                                continue;
-                            }
-                            Ok(Err(e)) => {
-                                tracing::error!("Write error: {}", e);
-                                break;
-                            }
-                            Err(_) => {
-                                // Not ready, retry
-                                continue;
+
+                            // Forward processed data to PTY
+                            let mut guard = pty_async.writable().await.unwrap();
+                            match guard.try_io(|inner| {
+                                let fd = inner.as_raw_fd();
+                                unsafe {
+                                    let result = libc::write(fd, data_to_forward.as_ptr() as *const libc::c_void, data_to_forward.len());
+                                    if result == -1 {
+                                        let errno = *libc::__error();
+                                        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                                            return Err(std::io::Error::from_raw_os_error(errno));
+                                        } else {
+                                            return Err(std::io::Error::from_raw_os_error(errno));
+                                        }
+                                    }
+                                    Ok(result as usize)
+                                }
+                            }) {
+                                Ok(Ok(_)) => {}, // Write successful
+                                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // Retry later
+                                    continue;
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::error!("Write error: {}", e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    // Not ready, retry
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -813,29 +989,133 @@ mod tests {
     }
 
     #[test]
-    fn test_window_resize_sequence_detection() {
-        // Test valid resize sequence
-        let resize_seq = b"\x1b[8;24;80t";
-        let result = detect_window_resize_sequence(resize_seq).unwrap();
-        assert_eq!(result.rows, 24);
-        assert_eq!(result.cols, 80);
+    fn test_input_parser_complete_sequence() {
+        let mut parser = InputParser::new();
 
-        // Test different sizes
-        let resize_seq = b"\x1b[8;30;120t";
-        let result = detect_window_resize_sequence(resize_seq).unwrap();
-        assert_eq!(result.rows, 30);
-        assert_eq!(result.cols, 120);
+        // Test complete resize sequence in one chunk
+        let input = b"\x1b[8;24;80t";
+        let (output, resize) = parser.process_bytes(input);
 
-        // Test invalid sequences
-        assert!(detect_window_resize_sequence(b"\x1b[8;24;80x").is_none()); // Wrong ending
-        assert!(detect_window_resize_sequence(b"\x1b[7;24;80t").is_none()); // Wrong number
-        assert!(detect_window_resize_sequence(b"\x1b[8;0;80t").is_none()); // Invalid rows
-        assert!(detect_window_resize_sequence(b"\x1b[8;24;0t").is_none()); // Invalid cols
-        assert!(detect_window_resize_sequence(b"\x1b[8;abc;80t").is_none()); // Non-numeric
-        assert!(detect_window_resize_sequence(b"hello").is_none()); // Not a sequence
+        assert!(output.is_empty()); // Resize sequence should not be forwarded
+        assert_eq!(resize, Some(WindowResizeData { rows: 24, cols: 80 }));
+    }
 
-        // Test sequence with extra data
-        assert!(detect_window_resize_sequence(b"\x1b[8;24;80textra").is_none()); // Extra chars
+    #[test]
+    fn test_input_parser_split_sequence() {
+        let mut parser = InputParser::new();
+
+        // Test sequence split across multiple chunks
+        let (output1, resize1) = parser.process_bytes(b"\x1b[8;2");
+        assert!(output1.is_empty());
+        assert!(resize1.is_none());
+
+        let (output2, resize2) = parser.process_bytes(b"4;80t");
+        assert!(output2.is_empty());
+        assert_eq!(resize2, Some(WindowResizeData { rows: 24, cols: 80 }));
+    }
+
+    #[test]
+    fn test_input_parser_mixed_data() {
+        let mut parser = InputParser::new();
+
+        // Test resize sequence mixed with normal data
+        let input = b"hello\x1b[8;30;120tworld";
+        let (output, resize) = parser.process_bytes(input);
+
+        assert_eq!(output, b"helloworld");
+        assert_eq!(
+            resize,
+            Some(WindowResizeData {
+                rows: 30,
+                cols: 120
+            })
+        );
+    }
+
+    #[test]
+    fn test_input_parser_invalid_sequences() {
+        let mut parser = InputParser::new();
+
+        // Test invalid sequence (wrong ending)
+        let (output, resize) = parser.process_bytes(b"\x1b[8;24;80x");
+        assert_eq!(output, b"\x1b[8;24;80x"); // Should forward invalid sequence
+        assert!(resize.is_none());
+
+        parser = InputParser::new();
+
+        // Test invalid sequence (wrong CSI command)
+        let (output, resize) = parser.process_bytes(b"\x1b[7;24;80t");
+        assert_eq!(output, b"\x1b[7;24;80t"); // Should forward invalid sequence
+        assert!(resize.is_none());
+
+        parser = InputParser::new();
+
+        // Test partial sequence interrupted by normal data
+        let (output, resize) = parser.process_bytes(b"\x1b[8;hello");
+        assert_eq!(output, b"\x1b[8;hello"); // Should forward when sequence becomes invalid
+        assert!(resize.is_none());
+    }
+
+    #[test]
+    fn test_input_parser_multiple_sequences() {
+        let mut parser = InputParser::new();
+
+        // Test multiple resize sequences
+        let input = b"\x1b[8;24;80t\x1b[8;30;120t";
+        let (output, resize) = parser.process_bytes(input);
+
+        assert!(output.is_empty());
+        // Should only detect the first complete sequence in a single call
+        assert_eq!(resize, Some(WindowResizeData { rows: 24, cols: 80 }));
+    }
+
+    #[test]
+    fn test_input_parser_edge_cases() {
+        let mut parser = InputParser::new();
+
+        // Test zero dimensions (invalid)
+        let (output, resize) = parser.process_bytes(b"\x1b[8;0;80t");
+        assert_eq!(output, b"\x1b[8;0;80t"); // Should forward invalid sequence
+        assert!(resize.is_none());
+
+        parser = InputParser::new();
+
+        // Test very large dimensions
+        let (output, resize) = parser.process_bytes(b"\x1b[8;999;999t");
+        assert!(output.is_empty());
+        assert_eq!(
+            resize,
+            Some(WindowResizeData {
+                rows: 999,
+                cols: 999
+            })
+        );
+
+        parser = InputParser::new();
+
+        // Test non-numeric dimensions
+        let (output, resize) = parser.process_bytes(b"\x1b[8;abc;80t");
+        assert_eq!(output, b"\x1b[8;abc;80t"); // Should forward invalid sequence
+        assert!(resize.is_none());
+    }
+
+    #[test]
+    fn test_input_parser_reset_after_detection() {
+        let mut parser = InputParser::new();
+
+        // Detect one sequence
+        let (_output1, resize1) = parser.process_bytes(b"\x1b[8;24;80t");
+        assert_eq!(resize1, Some(WindowResizeData { rows: 24, cols: 80 }));
+
+        // Should be reset and ready for another sequence
+        let (_output2, resize2) = parser.process_bytes(b"\x1b[8;30;120t");
+        assert_eq!(
+            resize2,
+            Some(WindowResizeData {
+                rows: 30,
+                cols: 120
+            })
+        );
     }
 
     #[test]
