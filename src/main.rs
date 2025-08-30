@@ -5,11 +5,11 @@ use clap::{Parser, Subcommand};
 use nix::pty::{forkpty, ForkptyResult};
 use nix::unistd;
 use std::ffi::CString;
-use std::os::unix::io::{FromRawFd, AsRawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::{File as TokioFile, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
 
@@ -64,10 +64,9 @@ async fn server_main() -> Result<()> {
     let pty_master_fd = pty_master.as_raw_fd();
     nix::fcntl::fcntl(pty_master_fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))?;
 
-    // Wrap the raw fd in Tokio's async-compatible file type
-    let pty_master_file = unsafe { TokioFile::from_raw_fd(pty_master_fd) };
-    let (pty_reader, pty_writer) = tokio::io::split(pty_master_file);
-    let pty_writer = Arc::new(Mutex::new(pty_writer));
+    // Use AsyncFd for proper async I/O with PTY
+    let pty_async = AsyncFd::new(pty_master_fd)?;
+    let pty_async = Arc::new(pty_async);
 
     let listener = UnixListener::bind(SOCKET_PATH)?;
     let log_file = Arc::new(Mutex::new(
@@ -80,16 +79,31 @@ async fn server_main() -> Result<()> {
     // 3. PTY Reader Task
     // This task reads from the PTY master and distributes the output.
     let tx_clone = tx.clone();
+    let pty_async_clone = pty_async.clone();
     tokio::spawn(async move {
-        let mut pty_reader = pty_reader;
         let mut buf = [0u8; 1024];
         loop {
-            match pty_reader.read(&mut buf).await {
-                Ok(0) => {
+            let mut guard = pty_async_clone.readable().await.unwrap();
+            match guard.try_io(|inner| {
+                let fd = inner.as_raw_fd();
+                unsafe {
+                    let result = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                    if result == -1 {
+                        let errno = *libc::__error();
+                        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                            return Err(std::io::Error::from_raw_os_error(errno));
+                        } else {
+                            return Err(std::io::Error::from_raw_os_error(errno));
+                        }
+                    }
+                    Ok(result as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
                     tracing::info!("PTY master EOF. Shell process likely exited.");
                     break;
                 }
-                Ok(n) => {
+                Ok(Ok(n)) => {
                     let data = buf[..n].to_vec();
                     
                     // a. Write to the log file
@@ -105,9 +119,17 @@ async fn server_main() -> Result<()> {
                         // This means no clients are connected, which is fine.
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Not ready yet, continue the loop
+                    continue;
+                }
+                Ok(Err(e)) => {
                     tracing::error!("Failed to read from PTY master: {}", e);
                     break;
+                }
+                Err(_) => {
+                    // Not ready yet, continue the loop
+                    continue;
                 }
             }
         }
@@ -119,11 +141,11 @@ async fn server_main() -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         tracing::info!("New client connected");
-        let pty_writer_clone = pty_writer.clone();
+        let pty_async_clone = pty_async.clone();
         let mut rx = tx.subscribe();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, pty_writer_clone, &mut rx).await {
+            if let Err(e) = handle_client(stream, pty_async_clone, &mut rx).await {
                 tracing::warn!("Client disconnected with error: {}", e);
             } else {
                 tracing::info!("Client disconnected gracefully.");
@@ -135,7 +157,7 @@ async fn server_main() -> Result<()> {
 // This function manages a single client's lifecycle.
 async fn handle_client(
     stream: UnixStream,
-    pty_writer: Arc<Mutex<tokio::io::WriteHalf<TokioFile>>>,
+    pty_async: Arc<AsyncFd<RawFd>>,
     rx: &mut broadcast::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
@@ -153,7 +175,36 @@ async fn handle_client(
                 match result {
                     Ok(0) => break, // Client disconnected
                     Ok(n) => {
-                        pty_writer.lock().await.write_all(&client_buf[..n]).await?;
+                        let mut guard = pty_async.writable().await.unwrap();
+                        match guard.try_io(|inner| {
+                            let fd = inner.as_raw_fd();
+                            unsafe {
+                                let result = libc::write(fd, client_buf[..n].as_ptr() as *const libc::c_void, n);
+                                if result == -1 {
+                                    let errno = *libc::__error();
+                                    if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                                        return Err(std::io::Error::from_raw_os_error(errno));
+                                    } else {
+                                        return Err(std::io::Error::from_raw_os_error(errno));
+                                    }
+                                }
+                                Ok(result as usize)
+                            }
+                        }) {
+                            Ok(Ok(_)) => {}, // Write successful
+                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // Retry later
+                                continue;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::error!("Write error: {}", e);
+                                break;
+                            }
+                            Err(_) => {
+                                // Not ready, retry
+                                continue;
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::error!("Error reading from client: {}", e);
