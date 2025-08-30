@@ -18,7 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
 
 use signals::SignalManager;
-use terminal::{TerminalState, is_terminal};
+use terminal::TerminalState;
 use winsize::{WindowSizeManager, get_terminal_size};
 
 /// Parse detach character from string (e.g., "^\" -> Ctrl-\, "^?" -> DEL)
@@ -38,6 +38,58 @@ fn parse_detach_char(detach_str: &str) -> Result<u8> {
             detach_str
         );
     }
+}
+
+/// Window resize data
+#[derive(Debug)]
+struct WindowResizeData {
+    rows: u16,
+    cols: u16,
+}
+
+/// Detect window resize escape sequence: \x1b[8;rows;colst
+fn detect_window_resize_sequence(data: &[u8]) -> Option<WindowResizeData> {
+    let data_str = std::str::from_utf8(data).ok()?;
+
+    // Look for the pattern: ESC[8;rows;cols;t
+    if data_str.starts_with("\x1b[8;") && data_str.ends_with('t') {
+        // Extract the middle part: "rows;cols"
+        let content = &data_str[4..data_str.len() - 1]; // Remove "\x1b[8;" and "t"
+        let parts: Vec<&str> = content.split(';').collect();
+
+        if parts.len() == 2 {
+            if let (Ok(rows), Ok(cols)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
+                if rows > 0 && cols > 0 {
+                    return Some(WindowResizeData { rows, cols });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Apply window size to PTY file descriptor
+fn apply_window_size_to_pty(pty_fd: RawFd, rows: u16, cols: u16) -> Result<()> {
+    use nix::libc::winsize;
+
+    let ws = winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let result = unsafe { nix::libc::ioctl(pty_fd, nix::libc::TIOCSWINSZ, &ws) };
+
+    if result < 0 {
+        anyhow::bail!(
+            "Failed to set window size: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    Ok(())
 }
 
 const SOCKET_PATH: &str = "/tmp/term-replay.sock";
@@ -221,13 +273,8 @@ async fn server_main() -> Result<()> {
     let signal_manager = SignalManager::new(false);
     signal_manager.setup_server_signals()?;
 
-    // Initialize window size manager
-    let mut window_manager = WindowSizeManager::new();
-    if is_terminal(0) {
-        window_manager.init_from_terminal(0).unwrap_or_else(|_| {
-            tracing::warn!("Failed to get terminal size, using defaults");
-        });
-    }
+    // Initialize window size manager with defaults for server
+    let window_manager = WindowSizeManager::new();
 
     // Clean up previous runs
     if Path::new(SOCKET_PATH).exists() {
@@ -438,21 +485,7 @@ async fn server_main() -> Result<()> {
     // This loop waits for new clients to connect and handles window size changes.
     tracing::info!("Server listening on {}", SOCKET_PATH);
     loop {
-        // Check for window size changes
-        if signal_manager.check_window_changed() {
-            let new_size = get_terminal_size();
-            if window_manager.update_size(new_size) {
-                tracing::debug!(
-                    "Server window size changed: {}x{}",
-                    new_size.cols,
-                    new_size.rows
-                );
-                // Apply new size to PTY
-                if let Err(e) = window_manager.apply_to_fd(pty_master_fd) {
-                    tracing::warn!("Failed to apply window size to PTY: {}", e);
-                }
-            }
-        }
+        // Server window size changes are handled per-client via escape sequences
 
         // Check for shutdown signal
         if signal_manager.check_shutdown_requested() {
@@ -518,7 +551,20 @@ async fn handle_client(
                     Ok(n) => {
                         let input_data = &client_buf[..n];
 
-                        // Log input data (client-to-PTY)
+                        // Check for window resize escape sequence
+                        if let Some(resize_data) = detect_window_resize_sequence(input_data) {
+                            tracing::debug!("Detected window resize: {}x{}", resize_data.cols, resize_data.rows);
+
+                            // Apply new window size to PTY
+                            if let Err(e) = apply_window_size_to_pty(pty_async.get_ref().as_raw_fd(), resize_data.rows, resize_data.cols) {
+                                tracing::warn!("Failed to apply window size to PTY: {}", e);
+                            }
+
+                            // Don't forward resize sequence to PTY, but continue processing
+                            continue;
+                        }
+
+                        // Log input data (client-to-PTY) - but not resize sequences
                         if let Some(input_log) = &input_log {
                             let mut log = input_log.lock().await;
                             if let Err(e) = log.write_all(input_data).await {
@@ -628,7 +674,17 @@ async fn client_main(detach_char: u8) -> Result<()> {
             let new_size = get_terminal_size();
             if window_manager.update_size(new_size) {
                 tracing::debug!("Window size changed: {}x{}", new_size.cols, new_size.rows);
-                // TODO: Send window size change to server via protocol message
+
+                // Send window resize escape sequence to server
+                let resize_seq = format!("\x1b[8;{};{}t", new_size.rows, new_size.cols);
+                if let Err(e) = server_writer.write_all(resize_seq.as_bytes()).await {
+                    tracing::error!("Failed to send window resize to server: {}", e);
+                    break;
+                }
+                if let Err(e) = server_writer.flush().await {
+                    tracing::error!("Failed to flush resize sequence: {}", e);
+                    break;
+                }
             }
         }
 
@@ -754,6 +810,32 @@ mod tests {
         // Test invalid formats
         assert!(parse_detach_char("^too_long").is_err());
         assert!(parse_detach_char("").is_err());
+    }
+
+    #[test]
+    fn test_window_resize_sequence_detection() {
+        // Test valid resize sequence
+        let resize_seq = b"\x1b[8;24;80t";
+        let result = detect_window_resize_sequence(resize_seq).unwrap();
+        assert_eq!(result.rows, 24);
+        assert_eq!(result.cols, 80);
+
+        // Test different sizes
+        let resize_seq = b"\x1b[8;30;120t";
+        let result = detect_window_resize_sequence(resize_seq).unwrap();
+        assert_eq!(result.rows, 30);
+        assert_eq!(result.cols, 120);
+
+        // Test invalid sequences
+        assert!(detect_window_resize_sequence(b"\x1b[8;24;80x").is_none()); // Wrong ending
+        assert!(detect_window_resize_sequence(b"\x1b[7;24;80t").is_none()); // Wrong number
+        assert!(detect_window_resize_sequence(b"\x1b[8;0;80t").is_none()); // Invalid rows
+        assert!(detect_window_resize_sequence(b"\x1b[8;24;0t").is_none()); // Invalid cols
+        assert!(detect_window_resize_sequence(b"\x1b[8;abc;80t").is_none()); // Non-numeric
+        assert!(detect_window_resize_sequence(b"hello").is_none()); // Not a sequence
+
+        // Test sequence with extra data
+        assert!(detect_window_resize_sequence(b"\x1b[8;24;80textra").is_none()); // Extra chars
     }
 
     #[test]
