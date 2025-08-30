@@ -21,6 +21,25 @@ use signals::SignalManager;
 use terminal::{TerminalState, is_terminal};
 use winsize::{WindowSizeManager, get_terminal_size};
 
+/// Parse detach character from string (e.g., "^\" -> Ctrl-\, "^?" -> DEL)
+fn parse_detach_char(detach_str: &str) -> Result<u8> {
+    if detach_str.starts_with('^') && detach_str.len() == 2 {
+        let ch = detach_str.chars().nth(1).unwrap();
+        if ch == '?' {
+            Ok(0x7F) // DEL
+        } else {
+            Ok((ch as u8) & 0x1F) // Control character
+        }
+    } else if detach_str.len() == 1 {
+        Ok(detach_str.chars().next().unwrap() as u8)
+    } else {
+        anyhow::bail!(
+            "Invalid detach character: '{}'. Use '^X' for control characters or '^?' for DEL",
+            detach_str
+        );
+    }
+}
+
 const SOCKET_PATH: &str = "/tmp/term-replay.sock";
 const LOG_PATH: &str = "/tmp/term-replay.log";
 const DEBUG_RAW_LOG_PATH: &str = "/tmp/term-replay-raw.log";
@@ -189,7 +208,11 @@ enum Commands {
     /// Start the persistent terminal server
     Server,
     /// Attach to the persistent terminal server
-    Client,
+    Client {
+        /// Set the detach character (default: Ctrl-\). Use '^?' for DEL, '^X' for Ctrl-X
+        #[arg(short = 'e', long = "escape", value_name = "CHAR")]
+        detach_char: Option<String>,
+    },
 }
 
 // SERVER LOGIC
@@ -559,7 +582,7 @@ async fn handle_client(
 }
 
 // CLIENT LOGIC
-async fn client_main() -> Result<()> {
+async fn client_main(detach_char: u8) -> Result<()> {
     // Initialize signal manager for client mode
     let signal_manager = SignalManager::new(true);
     signal_manager.setup_client_signals()?;
@@ -626,8 +649,27 @@ async fn client_main() -> Result<()> {
                         break;
                     }
                     Ok(n) => {
-                        // TODO: Process detach key and other special sequences
-                        if let Err(e) = server_writer.write_all(&stdin_buf[..n]).await {
+                        // Process input for detach key
+                        let input_data = &stdin_buf[..n];
+
+                        // Check for detach character in input
+                        if let Some(detach_pos) = input_data.iter().position(|&b| b == detach_char) {
+                            // Send any data before the detach key
+                            if detach_pos > 0 {
+                                if let Err(e) = server_writer.write_all(&input_data[..detach_pos]).await {
+                                    tracing::error!("Failed to write to server: {}", e);
+                                }
+                                let _ = server_writer.flush().await;
+                            }
+
+                            // Handle detach: show message and exit gracefully
+                            print!("\x1b[999H\r\n[detached]\r\n");
+                            std::io::Write::flush(&mut std::io::stdout())?;
+                            break;
+                        }
+
+                        // No detach key found, send all data to server
+                        if let Err(e) = server_writer.write_all(input_data).await {
                             tracing::error!("Failed to write to server: {}", e);
                             break;
                         }
@@ -681,13 +723,38 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server => server_main().await,
-        Commands::Client => client_main().await,
+        Commands::Client { detach_char } => {
+            let detach_byte = if let Some(char_str) = detach_char {
+                parse_detach_char(&char_str)?
+            } else {
+                0x1C // Default: Ctrl-\
+            };
+            client_main(detach_byte).await
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_detach_char_parsing() {
+        // Test control characters
+        assert_eq!(parse_detach_char("^\\").unwrap(), 0x1C); // Ctrl-\
+        assert_eq!(parse_detach_char("^C").unwrap(), 0x03); // Ctrl-C
+        assert_eq!(parse_detach_char("^A").unwrap(), 0x01); // Ctrl-A
+
+        // Test DEL
+        assert_eq!(parse_detach_char("^?").unwrap(), 0x7F); // DEL
+
+        // Test single character
+        assert_eq!(parse_detach_char("x").unwrap(), b'x');
+
+        // Test invalid formats
+        assert!(parse_detach_char("^too_long").is_err());
+        assert!(parse_detach_char("").is_err());
+    }
 
     #[test]
     fn test_escape_parser_with_vim_session() {
