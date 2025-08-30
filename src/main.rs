@@ -15,6 +15,10 @@ use tokio::sync::{Mutex, broadcast};
 
 const SOCKET_PATH: &str = "/tmp/term-replay.sock";
 const LOG_PATH: &str = "/tmp/term-replay.log";
+const DEBUG_RAW_LOG_PATH: &str = "/tmp/term-replay-raw.log";
+
+// Debug flag - set to true to enable raw logging
+const DEBUG_RAW_LOGGING: bool = true;
 
 // Terminal mode tracking
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -187,6 +191,9 @@ async fn server_main() -> Result<()> {
     if Path::new(LOG_PATH).exists() {
         std::fs::remove_file(LOG_PATH)?;
     }
+    if DEBUG_RAW_LOGGING && Path::new(DEBUG_RAW_LOG_PATH).exists() {
+        std::fs::remove_file(DEBUG_RAW_LOG_PATH)?;
+    }
 
     // 1. Create the Pseudo-Terminal (PTY)
     // This is a synchronous, low-level call.
@@ -240,6 +247,19 @@ async fn server_main() -> Result<()> {
             .await?,
     ));
 
+    // Debug raw log file (logs ALL data, unfiltered)
+    let debug_raw_log = if DEBUG_RAW_LOGGING {
+        Some(Arc::new(Mutex::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(DEBUG_RAW_LOG_PATH)
+                .await?,
+        )))
+    } else {
+        None
+    };
+
     // Broadcast channel to send PTY output to all connected clients
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
 
@@ -247,6 +267,7 @@ async fn server_main() -> Result<()> {
     // This task reads from the PTY master and distributes the output.
     let tx_clone = tx.clone();
     let pty_async_clone = pty_async.clone();
+    let debug_raw_log_clone = debug_raw_log.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         let mut parser = EscapeParser::new();
@@ -278,31 +299,40 @@ async fn server_main() -> Result<()> {
                 Ok(Ok(n)) => {
                     let data = buf[..n].to_vec();
 
-                    // Parse escape sequences to detect mode changes
+                    // 1. ALWAYS forward raw data to clients and raw debug log
+                    // This happens FIRST, unconditionally
+
+                    // Raw debug logging - write ALL data unconditionally
+                    if let Some(debug_log) = &debug_raw_log_clone {
+                        let mut debug = debug_log.lock().await;
+                        if let Err(e) = debug.write_all(&data).await {
+                            tracing::error!("Failed to write to debug raw log: {}", e);
+                        }
+                    }
+
+                    // Always broadcast to all clients (they see everything live)
+                    if tx_clone.send(data.clone()).is_err() {
+                        // This means no clients are connected, which is fine.
+                    }
+
+                    // 2. SEPARATE filtered logging pipeline
+                    // Parse escape sequences and create filtered data for main log
                     let actions = parser.parse(&data);
 
-                    let mut skip_logging = false;
-
-                    for action in actions {
+                    for action in &actions {
                         match action {
                             SequenceAction::EnterAlternateScreen => {
                                 tracing::debug!("Entering alternate screen mode");
                                 terminal_mode = TerminalMode::Alternate;
-                                skip_logging = true; // Don't log the enter sequence
                             }
                             SequenceAction::ExitAlternateScreen => {
                                 tracing::debug!("Exiting alternate screen mode");
                                 terminal_mode = TerminalMode::Normal;
-                                skip_logging = true; // Don't log the exit sequence
                             }
                             SequenceAction::DestructiveClear => {
                                 tracing::debug!("Destructive clear detected");
-                                // First broadcast the clear to all clients
-                                if tx_clone.send(data.clone()).is_err() {
-                                    // No clients connected
-                                }
 
-                                // Then truncate the log file
+                                // Truncate the log file
                                 {
                                     let mut log = log_file.lock().await;
                                     if let Err(e) = log.set_len(0).await {
@@ -312,33 +342,16 @@ async fn server_main() -> Result<()> {
                                         tracing::error!("Failed to seek to start of log: {}", e);
                                     }
                                 }
-
-                                // Skip the normal logging and broadcasting for this data
-                                continue;
                             }
                         }
                     }
 
-                    // If we detected alternate screen sequences, skip logging this chunk entirely
-                    if skip_logging {
-                        // Still broadcast to live clients
-                        if tx_clone.send(data).is_err() {
-                            // No clients connected
-                        }
-                        continue;
-                    }
-
-                    // a. Write to the log file (only in Normal mode)
-                    if terminal_mode == TerminalMode::Normal {
+                    // Write to filtered log only in Normal mode and only if no special sequences
+                    if terminal_mode == TerminalMode::Normal && actions.is_empty() {
                         let mut log = log_file.lock().await;
                         if let Err(e) = log.write_all(&data).await {
                             tracing::error!("Failed to write to log: {}", e);
                         }
-                    }
-
-                    // b. Always broadcast to all clients (they see everything live)
-                    if tx_clone.send(data).is_err() {
-                        // This means no clients are connected, which is fine.
                     }
                 }
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -581,4 +594,20 @@ mod tests {
             ]
         );
     }
+}
+
+#[test]
+fn test_multiple_sequences_in_chunk() {
+    let mut parser = EscapeParser::new();
+
+    // Your actual sequence: ESC[2J ESC[3J ESC[H
+    let multi_seq = b"[2J[3J[H";
+
+    let actions = parser.parse(multi_seq);
+
+    println!("Multi-sequence - Parser state: {:?}", parser.state);
+    println!("Multi-sequence - Detected actions: {:?}", actions);
+
+    // Should detect the destructive clear
+    assert!(actions.contains(&SequenceAction::DestructiveClear));
 }
