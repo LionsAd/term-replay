@@ -2,19 +2,127 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use nix::pty::{forkpty, ForkptyResult};
+use nix::pty::{ForkptyResult, forkpty};
 use nix::unistd;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::{File as TokioFile, OpenOptions};
-use tokio::io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, unix::AsyncFd};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 const SOCKET_PATH: &str = "/tmp/term-replay.sock";
 const LOG_PATH: &str = "/tmp/term-replay.log";
+
+// Terminal mode tracking
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TerminalMode {
+    Normal,    // Log everything
+    Alternate, // Skip logging (vim, less, etc.)
+}
+
+// Escape sequence parser state
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ParseState {
+    Normal,
+    Escape,      // Saw ESC (\x1b)
+    Csi,         // Saw ESC [
+    CsiQuestion, // Saw ESC [ ?
+    Csi1049,     // Saw ESC [ ? 1 0 4 9
+    Csi3,        // Saw ESC [ 3
+}
+
+// Actions to take based on detected sequences
+#[derive(Debug, Clone, PartialEq)]
+enum SequenceAction {
+    EnterAlternateScreen,
+    ExitAlternateScreen,
+    DestructiveClear,
+}
+
+// Escape sequence parser
+struct EscapeParser {
+    state: ParseState,
+    buffer: Vec<u8>,
+}
+
+impl EscapeParser {
+    fn new() -> Self {
+        Self {
+            state: ParseState::Normal,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn parse(&mut self, data: &[u8]) -> Vec<SequenceAction> {
+        let mut actions = Vec::new();
+
+        for &byte in data {
+            self.buffer.push(byte);
+
+            match self.state {
+                ParseState::Normal => {
+                    if byte == 0x1b {
+                        // ESC
+                        self.state = ParseState::Escape;
+                    }
+                }
+                ParseState::Escape => {
+                    if byte == b'[' {
+                        self.state = ParseState::Csi;
+                    } else {
+                        self.reset();
+                    }
+                }
+                ParseState::Csi => {
+                    if byte == b'?' {
+                        self.state = ParseState::CsiQuestion;
+                    } else if byte == b'3' {
+                        self.state = ParseState::Csi3;
+                    } else {
+                        self.reset();
+                    }
+                }
+                ParseState::CsiQuestion => {
+                    if byte == b'1' {
+                        // Could be start of 1049
+                        self.state = ParseState::Csi1049;
+                    } else {
+                        self.reset();
+                    }
+                }
+                ParseState::Csi1049 => {
+                    if self.buffer.ends_with(b"\x1b[?1049h") {
+                        actions.push(SequenceAction::EnterAlternateScreen);
+                        self.reset();
+                    } else if self.buffer.ends_with(b"\x1b[?1049l") {
+                        actions.push(SequenceAction::ExitAlternateScreen);
+                        self.reset();
+                    } else if !b"1049hl".contains(&byte) {
+                        self.reset();
+                    }
+                }
+                ParseState::Csi3 => {
+                    if byte == b'J' {
+                        actions.push(SequenceAction::DestructiveClear);
+                        self.reset();
+                    } else {
+                        self.reset();
+                    }
+                }
+            }
+        }
+
+        actions
+    }
+
+    fn reset(&mut self) {
+        self.state = ParseState::Normal;
+        self.buffer.clear();
+    }
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -45,18 +153,22 @@ async fn server_main() -> Result<()> {
     // This is a synchronous, low-level call.
     let pty_master = match unsafe { forkpty(None, None)? } {
         ForkptyResult::Parent { master, child } => {
-            tracing::info!("PTY created. Master fd: {}, Child pid: {}", master.as_raw_fd(), child);
+            tracing::info!(
+                "PTY created. Master fd: {}, Child pid: {}",
+                master.as_raw_fd(),
+                child
+            );
             // In parent process, we continue.
             master
         }
         ForkptyResult::Child => {
             // In child process, we execute a shell.
             let shell_path = CString::new("/bin/bash")?;
-            
+
             // --- THIS IS THE FIX ---
             // The leading dash tells bash to run as a login shell.
-            let shell_arg0 = CString::new("-bash")?; 
-            
+            let shell_arg0 = CString::new("-bash")?;
+
             // The first argument in the `args` array is what the program
             // sees as its own name (`argv[0]`).
             let args = [shell_arg0.as_c_str()];
@@ -71,7 +183,10 @@ async fn server_main() -> Result<()> {
     // 2. Setup Async Wrappers and Channels
     // Make the PTY master file descriptor non-blocking for use with tokio
     let pty_master_fd = pty_master.as_raw_fd();
-    nix::fcntl::fcntl(pty_master_fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))?;
+    nix::fcntl::fcntl(
+        pty_master_fd,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )?;
 
     // Use AsyncFd for proper async I/O with PTY
     let pty_async = AsyncFd::new(pty_master_fd)?;
@@ -79,7 +194,11 @@ async fn server_main() -> Result<()> {
 
     let listener = UnixListener::bind(SOCKET_PATH)?;
     let log_file = Arc::new(Mutex::new(
-        OpenOptions::new().create(true).append(true).open(LOG_PATH).await?,
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(LOG_PATH)
+            .await?,
     ));
 
     // Broadcast channel to send PTY output to all connected clients
@@ -91,6 +210,9 @@ async fn server_main() -> Result<()> {
     let pty_async_clone = pty_async.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
+        let mut parser = EscapeParser::new();
+        let mut terminal_mode = TerminalMode::Normal;
+
         loop {
             let mut guard = pty_async_clone.readable().await.unwrap();
             match guard.try_io(|inner| {
@@ -110,20 +232,59 @@ async fn server_main() -> Result<()> {
             }) {
                 Ok(Ok(0)) => {
                     tracing::info!("PTY master EOF. Shell process likely exited.");
+                    // Reset terminal mode on EOF (handles crashed applications)
+                    terminal_mode = TerminalMode::Normal;
                     break;
                 }
                 Ok(Ok(n)) => {
                     let data = buf[..n].to_vec();
-                    
-                    // a. Write to the log file
-                    {
+
+                    // Parse escape sequences to detect mode changes
+                    let actions = parser.parse(&data);
+
+                    for action in actions {
+                        match action {
+                            SequenceAction::EnterAlternateScreen => {
+                                tracing::debug!("Entering alternate screen mode");
+                                terminal_mode = TerminalMode::Alternate;
+                            }
+                            SequenceAction::ExitAlternateScreen => {
+                                tracing::debug!("Exiting alternate screen mode");
+                                terminal_mode = TerminalMode::Normal;
+                            }
+                            SequenceAction::DestructiveClear => {
+                                tracing::debug!("Destructive clear detected");
+                                // First broadcast the clear to all clients
+                                if tx_clone.send(data.clone()).is_err() {
+                                    // No clients connected
+                                }
+
+                                // Then truncate the log file
+                                {
+                                    let mut log = log_file.lock().await;
+                                    if let Err(e) = log.set_len(0).await {
+                                        tracing::error!("Failed to truncate log file: {}", e);
+                                    }
+                                    if let Err(e) = log.seek(std::io::SeekFrom::Start(0)).await {
+                                        tracing::error!("Failed to seek to start of log: {}", e);
+                                    }
+                                }
+
+                                // Skip the normal logging and broadcasting for this data
+                                continue;
+                            }
+                        }
+                    }
+
+                    // a. Write to the log file (only in Normal mode)
+                    if terminal_mode == TerminalMode::Normal {
                         let mut log = log_file.lock().await;
                         if let Err(e) = log.write_all(&data).await {
                             tracing::error!("Failed to write to log: {}", e);
                         }
                     }
 
-                    // b. Broadcast to all clients
+                    // b. Always broadcast to all clients (they see everything live)
                     if tx_clone.send(data).is_err() {
                         // This means no clients are connected, which is fine.
                     }
@@ -174,7 +335,7 @@ async fn handle_client(
     // a. Replay history
     let mut history_file = TokioFile::open(LOG_PATH).await?;
     tokio::io::copy(&mut history_file, &mut client_writer).await?;
-    
+
     loop {
         let mut client_buf = [0u8; 1024];
 
@@ -239,11 +400,13 @@ async fn handle_client(
     Ok(())
 }
 
-
 // CLIENT LOGIC
 async fn client_main() -> Result<()> {
     if !Path::new(SOCKET_PATH).exists() {
-        anyhow::bail!("Server socket not found at {}. Is the server running?", SOCKET_PATH);
+        anyhow::bail!(
+            "Server socket not found at {}. Is the server running?",
+            SOCKET_PATH
+        );
     }
 
     let stream = UnixStream::connect(SOCKET_PATH).await?;
@@ -253,14 +416,12 @@ async fn client_main() -> Result<()> {
     let mut stdout = tokio::io::stdout();
 
     // Two tasks: one for stdin -> server, one for server -> stdout
-    let client_to_server = tokio::spawn(async move {
-        tokio::io::copy(&mut stdin, &mut server_writer).await
-    });
+    let client_to_server =
+        tokio::spawn(async move { tokio::io::copy(&mut stdin, &mut server_writer).await });
 
-    let server_to_client = tokio::spawn(async move {
-        tokio::io::copy(&mut server_reader, &mut stdout).await
-    });
-    
+    let server_to_client =
+        tokio::spawn(async move { tokio::io::copy(&mut server_reader, &mut stdout).await });
+
     // Wait for either direction to finish
     tokio::select! {
         res = client_to_server => {
