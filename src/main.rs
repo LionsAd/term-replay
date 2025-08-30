@@ -51,9 +51,18 @@ async fn server_main() -> Result<()> {
         }
         ForkptyResult::Child => {
             // In child process, we execute a shell.
-            let shell = CString::new("/bin/bash")?;
-            let args = [shell.as_c_str()];
-            unistd::execvp(&shell, &args)?;
+            let shell_path = CString::new("/bin/bash")?;
+            
+            // --- THIS IS THE FIX ---
+            // The leading dash tells bash to run as a login shell.
+            let shell_arg0 = CString::new("-bash")?; 
+            
+            // The first argument in the `args` array is what the program
+            // sees as its own name (`argv[0]`).
+            let args = [shell_arg0.as_c_str()];
+
+            // We still execute the program at `/bin/bash`
+            unistd::execvp(&shell_path, &args)?;
             // execvp replaces the current process, so this is unreachable
             unreachable!();
         }
