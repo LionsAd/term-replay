@@ -1,5 +1,9 @@
 // src/main.rs
 
+mod signals;
+mod terminal;
+mod winsize;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use nix::pty::{ForkptyResult, forkpty};
@@ -12,6 +16,10 @@ use tokio::fs::{File as TokioFile, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, unix::AsyncFd};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
+
+use signals::SignalManager;
+use terminal::{TerminalState, is_terminal};
+use winsize::{WindowSizeManager, get_terminal_size};
 
 const SOCKET_PATH: &str = "/tmp/term-replay.sock";
 const LOG_PATH: &str = "/tmp/term-replay.log";
@@ -186,6 +194,18 @@ enum Commands {
 
 // SERVER LOGIC
 async fn server_main() -> Result<()> {
+    // Initialize signal manager for server mode
+    let signal_manager = SignalManager::new(false);
+    signal_manager.setup_server_signals()?;
+
+    // Initialize window size manager
+    let mut window_manager = WindowSizeManager::new();
+    if is_terminal(0) {
+        window_manager.init_from_terminal(0).unwrap_or_else(|_| {
+            tracing::warn!("Failed to get terminal size, using defaults");
+        });
+    }
+
     // Clean up previous runs
     if Path::new(SOCKET_PATH).exists() {
         std::fs::remove_file(SOCKET_PATH)?;
@@ -238,6 +258,9 @@ async fn server_main() -> Result<()> {
         pty_master_fd,
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
     )?;
+
+    // Apply initial window size to PTY
+    window_manager.apply_to_fd(pty_master_fd)?;
 
     // Use AsyncFd for proper async I/O with PTY
     let pty_async = AsyncFd::new(pty_master_fd)?;
@@ -388,23 +411,63 @@ async fn server_main() -> Result<()> {
         }
     });
 
-    // 4. Main Accept Loop
-    // This loop waits for new clients to connect.
+    // 4. Main Accept Loop with Signal Handling
+    // This loop waits for new clients to connect and handles window size changes.
     tracing::info!("Server listening on {}", SOCKET_PATH);
     loop {
-        let (stream, _) = listener.accept().await?;
-        tracing::info!("New client connected");
-        let pty_async_clone = pty_async.clone();
-        let input_log_clone = input_log.clone();
-        let mut rx = tx.subscribe();
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, pty_async_clone, input_log_clone, &mut rx).await {
-                tracing::warn!("Client disconnected with error: {}", e);
-            } else {
-                tracing::info!("Client disconnected gracefully.");
+        // Check for window size changes
+        if signal_manager.check_window_changed() {
+            let new_size = get_terminal_size();
+            if window_manager.update_size(new_size) {
+                tracing::debug!(
+                    "Server window size changed: {}x{}",
+                    new_size.cols,
+                    new_size.rows
+                );
+                // Apply new size to PTY
+                if let Err(e) = window_manager.apply_to_fd(pty_master_fd) {
+                    tracing::warn!("Failed to apply window size to PTY: {}", e);
+                }
             }
-        });
+        }
+
+        // Check for shutdown signal
+        if signal_manager.check_shutdown_requested() {
+            if let Some(sig) = signal_manager.get_shutdown_signal() {
+                tracing::info!("Received shutdown signal: {:?}, terminating server", sig);
+            }
+            return Ok(());
+        }
+
+        tokio::select! {
+            // Accept new client connections
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        tracing::info!("New client connected");
+                        let pty_async_clone = pty_async.clone();
+                        let input_log_clone = input_log.clone();
+                        let mut rx = tx.subscribe();
+
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(stream, pty_async_clone, input_log_clone, &mut rx).await {
+                                tracing::warn!("Client disconnected with error: {}", e);
+                            } else {
+                                tracing::info!("Client disconnected gracefully.");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to accept client connection: {}", e);
+                    }
+                }
+            }
+
+            // Small delay to prevent busy looping
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+                // Continue the loop to check signals
+            }
+        }
     }
 }
 
@@ -497,6 +560,21 @@ async fn handle_client(
 
 // CLIENT LOGIC
 async fn client_main() -> Result<()> {
+    // Initialize signal manager for client mode
+    let signal_manager = SignalManager::new(true);
+    signal_manager.setup_client_signals()?;
+
+    // Initialize terminal state
+    let mut terminal_state = TerminalState::new()?;
+    if !terminal_state.is_terminal_available() {
+        anyhow::bail!("Attaching to a session requires a terminal.");
+    }
+
+    // Get initial window size
+    let initial_window_size = get_terminal_size();
+    let mut window_manager = WindowSizeManager::new();
+    window_manager.update_size(initial_window_size);
+
     if !Path::new(SOCKET_PATH).exists() {
         anyhow::bail!(
             "Server socket not found at {}. Is the server running?",
@@ -507,25 +585,91 @@ async fn client_main() -> Result<()> {
     let stream = UnixStream::connect(SOCKET_PATH).await?;
     let (mut server_reader, mut server_writer) = tokio::io::split(stream);
 
+    // Enter raw terminal mode for proper terminal control
+    terminal_state.enter_raw_mode()?;
+
+    // Clear screen and position cursor at bottom
+    print!("\x1b[H\x1b[J");
+    std::io::Write::flush(&mut std::io::stdout())?;
+
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
-    // Two tasks: one for stdin -> server, one for server -> stdout
-    let client_to_server =
-        tokio::spawn(async move { tokio::io::copy(&mut stdin, &mut server_writer).await });
+    // Enhanced client loop with signal handling
+    let mut stdin_buf = [0u8; 1024];
+    let mut server_buf = [0u8; 1024];
 
-    let server_to_client =
-        tokio::spawn(async move { tokio::io::copy(&mut server_reader, &mut stdout).await });
-
-    // Wait for either direction to finish
-    tokio::select! {
-        res = client_to_server => {
-            tracing::info!("Local stdin closed. {:?}", res);
+    loop {
+        // Check for window size changes
+        if signal_manager.check_window_changed() {
+            let new_size = get_terminal_size();
+            if window_manager.update_size(new_size) {
+                tracing::debug!("Window size changed: {}x{}", new_size.cols, new_size.rows);
+                // TODO: Send window size change to server via protocol message
+            }
         }
-        res = server_to_client => {
-            tracing::info!("Connection to server closed. {:?}", res);
+
+        // Check for shutdown signal
+        if signal_manager.check_shutdown_requested() {
+            if let Some(sig) = signal_manager.get_shutdown_signal() {
+                tracing::info!("Received shutdown signal: {:?}", sig);
+            }
+            break;
+        }
+
+        tokio::select! {
+            // Handle keyboard input
+            result = stdin.read(&mut stdin_buf) => {
+                match result {
+                    Ok(0) => {
+                        tracing::info!("Local stdin closed");
+                        break;
+                    }
+                    Ok(n) => {
+                        // TODO: Process detach key and other special sequences
+                        if let Err(e) = server_writer.write_all(&stdin_buf[..n]).await {
+                            tracing::error!("Failed to write to server: {}", e);
+                            break;
+                        }
+                        if let Err(e) = server_writer.flush().await {
+                            tracing::error!("Failed to flush server writer: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Error reading from stdin: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Handle server output
+            result = server_reader.read(&mut server_buf) => {
+                match result {
+                    Ok(0) => {
+                        tracing::info!("Connection to server closed");
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = stdout.write_all(&server_buf[..n]).await {
+                            tracing::error!("Failed to write to stdout: {}", e);
+                            break;
+                        }
+                        if let Err(e) = stdout.flush().await {
+                            tracing::error!("Failed to flush stdout: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Error reading from server: {}", e);
+                        break;
+                    }
+                }
+            }
         }
     }
+
+    // Terminal state will be automatically restored by Drop trait
 
     Ok(())
 }
