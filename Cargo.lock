@@ -1155,9 +1155,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
  "term-client",
  "term-protocol",
  "term-server",
+ "term-session",
  "tokio",
  "tracing",
  "tracing-subscriber",
