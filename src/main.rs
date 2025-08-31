@@ -261,6 +261,160 @@ fn apply_window_size_to_pty(pty_fd: RawFd, rows: u16, cols: u16) -> Result<()> {
     Ok(())
 }
 
+/// Create a new PTY with bash process - returns (pty_master, child_pid)
+fn create_new_pty_with_bash() -> Result<(std::os::unix::io::OwnedFd, nix::unistd::Pid)> {
+    // Create a completely new PTY since the old one is dead
+    let pty_master = match unsafe { forkpty(None, None)? } {
+        ForkptyResult::Parent { master, child } => {
+            tracing::info!(
+                "Created new PTY. Master fd: {}, Child pid: {}",
+                master.as_raw_fd(),
+                child
+            );
+            (master, child)
+        }
+        ForkptyResult::Child => {
+            // In child process, execute bash
+            let shell_path = CString::new("/bin/bash")?;
+            let shell_arg0 = CString::new("-bash")?;
+            let args = [shell_arg0.as_c_str()];
+
+            unistd::execvp(&shell_path, &args)?;
+            unreachable!();
+        }
+    };
+
+    Ok(pty_master)
+}
+
+/// PTY reader task that handles PTY output and manages PTY lifecycle
+async fn pty_reader_task(
+    pty_async_fd: Arc<AsyncFd<RawFd>>,
+    tx: broadcast::Sender<Vec<u8>>,
+    debug_raw_log: Option<Arc<Mutex<TokioFile>>>,
+    log_file: Arc<Mutex<TokioFile>>,
+    pty_async_shared: Arc<Mutex<Option<Arc<AsyncFd<RawFd>>>>>,
+) {
+    let mut buf = [0u8; 1024];
+    let mut parser = EscapeParser::new();
+    let mut terminal_mode = TerminalMode::Normal;
+
+    loop {
+        let mut guard = pty_async_fd.readable().await.unwrap();
+        match guard.try_io(|inner| {
+            let fd = inner.as_raw_fd();
+            unsafe {
+                let result = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                if result == -1 {
+                    let errno = *libc::__error();
+                    if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                        return Err(std::io::Error::from_raw_os_error(errno));
+                    } else {
+                        return Err(std::io::Error::from_raw_os_error(errno));
+                    }
+                }
+                Ok(result as usize)
+            }
+        }) {
+            Ok(Ok(0)) => {
+                tracing::info!("PTY master EOF. Shell process exited.");
+
+                // Clear the shared PTY reference - back to "no PTY" state
+                {
+                    let mut pty_guard = pty_async_shared.lock().await;
+                    *pty_guard = None;
+                }
+
+                // Write an exit message to the main log
+                let exit_message = format!(
+                    "\r\n[{}] Shell process exited. Session can be reconnected.\r\n",
+                    chrono::Utc::now().format("%H:%M:%S")
+                );
+
+                // Write to session log
+                {
+                    let mut log = log_file.lock().await;
+                    if let Err(e) = log.write_all(exit_message.as_bytes()).await {
+                        tracing::error!("Failed to write exit message to log: {}", e);
+                    }
+                }
+
+                // Broadcast exit message and then close the channel to disconnect all clients
+                let _ = tx.send(exit_message.as_bytes().to_vec());
+
+                tracing::info!("PTY reader task exiting - server ready for new connections");
+                break;
+            }
+            Ok(Ok(n)) => {
+                let data = buf[..n].to_vec();
+
+                // Raw debug logging - write ALL data unconditionally
+                if let Some(debug_log) = &debug_raw_log {
+                    let mut debug = debug_log.lock().await;
+                    if let Err(e) = debug.write_all(&data).await {
+                        tracing::error!("Failed to write to debug raw log: {}", e);
+                    }
+                }
+
+                // Always broadcast to all clients (they see everything live)
+                if tx.send(data.clone()).is_err() {
+                    // This means no clients are connected, which is fine.
+                }
+
+                // Parse escape sequences and create filtered data for main log
+                let actions = parser.parse(&data);
+
+                for action in &actions {
+                    match action {
+                        SequenceAction::EnterAlternateScreen => {
+                            tracing::debug!("Entering alternate screen mode");
+                            terminal_mode = TerminalMode::Alternate;
+                        }
+                        SequenceAction::ExitAlternateScreen => {
+                            tracing::debug!("Exiting alternate screen mode");
+                            terminal_mode = TerminalMode::Normal;
+                        }
+                        SequenceAction::DestructiveClear => {
+                            tracing::debug!("Destructive clear detected");
+
+                            // Truncate the log file
+                            {
+                                let mut log = log_file.lock().await;
+                                if let Err(e) = log.set_len(0).await {
+                                    tracing::error!("Failed to truncate log file: {}", e);
+                                }
+                                if let Err(e) = log.seek(std::io::SeekFrom::Start(0)).await {
+                                    tracing::error!("Failed to seek to start of log: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Write to filtered log only in Normal mode and only if no special sequences
+                if terminal_mode == TerminalMode::Normal && actions.is_empty() {
+                    let mut log = log_file.lock().await;
+                    if let Err(e) = log.write_all(&data).await {
+                        tracing::error!("Failed to write to log: {}", e);
+                    }
+                }
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Not ready yet, continue the loop
+                continue;
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Failed to read from PTY master: {}", e);
+                break;
+            }
+            Err(_) => {
+                // Not ready yet, continue the loop
+                continue;
+            }
+        }
+    }
+}
+
 const SOCKET_PATH: &str = "/tmp/term-replay.sock";
 const LOG_PATH: &str = "/tmp/term-replay.log";
 const DEBUG_RAW_LOG_PATH: &str = "/tmp/term-replay-raw.log";
@@ -459,51 +613,7 @@ async fn server_main() -> Result<()> {
         std::fs::remove_file(INPUT_LOG_PATH)?;
     }
 
-    // 1. Create the Pseudo-Terminal (PTY)
-    // This is a synchronous, low-level call.
-    let pty_master = match unsafe { forkpty(None, None)? } {
-        ForkptyResult::Parent { master, child } => {
-            tracing::info!(
-                "PTY created. Master fd: {}, Child pid: {}",
-                master.as_raw_fd(),
-                child
-            );
-            // In parent process, we continue.
-            master
-        }
-        ForkptyResult::Child => {
-            // In child process, we execute a shell.
-            let shell_path = CString::new("/bin/bash")?;
-
-            // --- THIS IS THE FIX ---
-            // The leading dash tells bash to run as a login shell.
-            let shell_arg0 = CString::new("-bash")?;
-
-            // The first argument in the `args` array is what the program
-            // sees as its own name (`argv[0]`).
-            let args = [shell_arg0.as_c_str()];
-
-            // We still execute the program at `/bin/bash`
-            unistd::execvp(&shell_path, &args)?;
-            // execvp replaces the current process, so this is unreachable
-            unreachable!();
-        }
-    };
-
-    // 2. Setup Async Wrappers and Channels
-    // Make the PTY master file descriptor non-blocking for use with tokio
-    let pty_master_fd = pty_master.as_raw_fd();
-    nix::fcntl::fcntl(
-        pty_master_fd,
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    )?;
-
-    // Apply initial window size to PTY
-    window_manager.apply_to_fd(pty_master_fd)?;
-
-    // Use AsyncFd for proper async I/O with PTY
-    let pty_async = AsyncFd::new(pty_master_fd)?;
-    let pty_async = Arc::new(pty_async);
+    // 1. No PTY creation at startup - will be created on first client connection
 
     let listener = UnixListener::bind(SOCKET_PATH)?;
     let log_file = Arc::new(Mutex::new(
@@ -543,112 +653,10 @@ async fn server_main() -> Result<()> {
     // Broadcast channel to send PTY output to all connected clients
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
 
-    // 3. PTY Reader Task
-    // This task reads from the PTY master and distributes the output.
-    let tx_clone = tx.clone();
-    let pty_async_clone = pty_async.clone();
-    let debug_raw_log_clone = debug_raw_log.clone();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        let mut parser = EscapeParser::new();
-        let mut terminal_mode = TerminalMode::Normal;
+    // Track PTY state - None when no PTY exists, Some when PTY is active
+    let pty_async: Arc<Mutex<Option<Arc<AsyncFd<RawFd>>>>> = Arc::new(Mutex::new(None));
 
-        loop {
-            let mut guard = pty_async_clone.readable().await.unwrap();
-            match guard.try_io(|inner| {
-                let fd = inner.as_raw_fd();
-                unsafe {
-                    let result = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
-                    if result == -1 {
-                        let errno = *libc::__error();
-                        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                            return Err(std::io::Error::from_raw_os_error(errno));
-                        } else {
-                            return Err(std::io::Error::from_raw_os_error(errno));
-                        }
-                    }
-                    Ok(result as usize)
-                }
-            }) {
-                Ok(Ok(0)) => {
-                    tracing::info!("PTY master EOF. Shell process likely exited.");
-                    // Reset terminal mode on EOF (handles crashed applications)
-                    terminal_mode = TerminalMode::Normal;
-                    break;
-                }
-                Ok(Ok(n)) => {
-                    let data = buf[..n].to_vec();
-
-                    // 1. ALWAYS forward raw data to clients and raw debug log
-                    // This happens FIRST, unconditionally
-
-                    // Raw debug logging - write ALL data unconditionally
-                    if let Some(debug_log) = &debug_raw_log_clone {
-                        let mut debug = debug_log.lock().await;
-                        if let Err(e) = debug.write_all(&data).await {
-                            tracing::error!("Failed to write to debug raw log: {}", e);
-                        }
-                    }
-
-                    // Always broadcast to all clients (they see everything live)
-                    if tx_clone.send(data.clone()).is_err() {
-                        // This means no clients are connected, which is fine.
-                    }
-
-                    // 2. SEPARATE filtered logging pipeline
-                    // Parse escape sequences and create filtered data for main log
-                    let actions = parser.parse(&data);
-
-                    for action in &actions {
-                        match action {
-                            SequenceAction::EnterAlternateScreen => {
-                                tracing::debug!("Entering alternate screen mode");
-                                terminal_mode = TerminalMode::Alternate;
-                            }
-                            SequenceAction::ExitAlternateScreen => {
-                                tracing::debug!("Exiting alternate screen mode");
-                                terminal_mode = TerminalMode::Normal;
-                            }
-                            SequenceAction::DestructiveClear => {
-                                tracing::debug!("Destructive clear detected");
-
-                                // Truncate the log file
-                                {
-                                    let mut log = log_file.lock().await;
-                                    if let Err(e) = log.set_len(0).await {
-                                        tracing::error!("Failed to truncate log file: {}", e);
-                                    }
-                                    if let Err(e) = log.seek(std::io::SeekFrom::Start(0)).await {
-                                        tracing::error!("Failed to seek to start of log: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Write to filtered log only in Normal mode and only if no special sequences
-                    if terminal_mode == TerminalMode::Normal && actions.is_empty() {
-                        let mut log = log_file.lock().await;
-                        if let Err(e) = log.write_all(&data).await {
-                            tracing::error!("Failed to write to log: {}", e);
-                        }
-                    }
-                }
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Not ready yet, continue the loop
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Failed to read from PTY master: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    // Not ready yet, continue the loop
-                    continue;
-                }
-            }
-        }
-    });
+    // 3. PTY Reader Task will be created on-demand when first client connects
 
     // 4. Main Accept Loop with Signal Handling
     // This loop waits for new clients to connect and handles window size changes.
@@ -670,7 +678,66 @@ async fn server_main() -> Result<()> {
                 match result {
                     Ok((stream, _)) => {
                         tracing::info!("New client connected");
-                        let pty_async_clone = pty_async.clone();
+
+                        // Check if we need to create a PTY
+                        let needs_pty = {
+                            let pty_guard = pty_async.lock().await;
+                            pty_guard.is_none()
+                        };
+
+                        if needs_pty {
+                            tracing::info!("No PTY exists, creating new PTY with bash...");
+
+                            // Create new PTY with bash
+                            match create_new_pty_with_bash() {
+                                Ok((pty_master, child_pid)) => {
+                                    tracing::info!("Created PTY with bash, PID: {}", child_pid);
+
+                                    // Make PTY non-blocking
+                                    let pty_master_fd = pty_master.as_raw_fd();
+                                    nix::fcntl::fcntl(
+                                        pty_master_fd,
+                                        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+                                    )?;
+
+                                    // Apply window size
+                                    window_manager.apply_to_fd(pty_master_fd)?;
+
+                                    // Create async wrapper
+                                    let pty_async_fd = Arc::new(AsyncFd::new(pty_master_fd)?);
+
+                                    // Store in shared state
+                                    {
+                                        let mut pty_guard = pty_async.lock().await;
+                                        *pty_guard = Some(pty_async_fd.clone());
+                                    }
+
+                                    // Start PTY reader task
+                                    let tx_clone = tx.clone();
+                                    let debug_raw_log_clone = debug_raw_log.clone();
+                                    let log_file_clone = log_file.clone();
+                                    let pty_async_clone = pty_async.clone();
+                                    tokio::spawn(pty_reader_task(
+                                        pty_async_fd,
+                                        tx_clone,
+                                        debug_raw_log_clone,
+                                        log_file_clone,
+                                        pty_async_clone,
+                                    ));
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to create PTY: {}", e);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Get current PTY for this client
+                        let pty_async_clone = {
+                            let pty_guard = pty_async.lock().await;
+                            pty_guard.clone()
+                        };
+
                         let input_log_clone = input_log.clone();
                         let mut rx = tx.subscribe();
 
@@ -699,7 +766,7 @@ async fn server_main() -> Result<()> {
 // This function manages a single client's lifecycle.
 async fn handle_client(
     stream: UnixStream,
-    pty_async: Arc<AsyncFd<RawFd>>,
+    pty_async: Option<Arc<AsyncFd<RawFd>>>,
     input_log: Option<Arc<Mutex<TokioFile>>>,
     rx: &mut broadcast::Receiver<Vec<u8>>,
 ) -> Result<()> {
@@ -730,9 +797,11 @@ async fn handle_client(
                         if let Some(resize) = resize_data {
                             tracing::info!("Detected window resize: {}x{}", resize.rows, resize.cols);
 
-                            // Apply new window size to PTY
-                            if let Err(e) = apply_window_size_to_pty(pty_async.get_ref().as_raw_fd(), resize.rows, resize.cols) {
-                                tracing::warn!("Failed to apply window size to PTY: {}", e);
+                            // Apply new window size to PTY (if PTY exists)
+                            if let Some(pty) = &pty_async {
+                                if let Err(e) = apply_window_size_to_pty(pty.get_ref().as_raw_fd(), resize.rows, resize.cols) {
+                                    tracing::warn!("Failed to apply window size to PTY: {}", e);
+                                }
                             }
                         }
 
@@ -746,36 +815,40 @@ async fn handle_client(
                                 }
                             }
 
-                            // Forward processed data to PTY
-                            let mut guard = pty_async.writable().await.unwrap();
-                            match guard.try_io(|inner| {
-                                let fd = inner.as_raw_fd();
-                                unsafe {
-                                    let result = libc::write(fd, data_to_forward.as_ptr() as *const libc::c_void, data_to_forward.len());
-                                    if result == -1 {
-                                        let errno = *libc::__error();
-                                        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                                            return Err(std::io::Error::from_raw_os_error(errno));
-                                        } else {
-                                            return Err(std::io::Error::from_raw_os_error(errno));
+                            // Forward processed data to PTY (if PTY exists)
+                            if let Some(pty) = &pty_async {
+                                let mut guard = pty.writable().await.unwrap();
+                                match guard.try_io(|inner| {
+                                    let fd = inner.as_raw_fd();
+                                    unsafe {
+                                        let result = libc::write(fd, data_to_forward.as_ptr() as *const libc::c_void, data_to_forward.len());
+                                        if result == -1 {
+                                            let errno = *libc::__error();
+                                            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                                                return Err(std::io::Error::from_raw_os_error(errno));
+                                            } else {
+                                                return Err(std::io::Error::from_raw_os_error(errno));
+                                            }
                                         }
+                                        Ok(result as usize)
                                     }
-                                    Ok(result as usize)
+                                }) {
+                                    Ok(Ok(_)) => {}, // Write successful
+                                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        // Retry later
+                                        continue;
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::error!("Write error: {}", e);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        // Not ready, retry
+                                        continue;
+                                    }
                                 }
-                            }) {
-                                Ok(Ok(_)) => {}, // Write successful
-                                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // Retry later
-                                    continue;
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::error!("Write error: {}", e);
-                                    break;
-                                }
-                                Err(_) => {
-                                    // Not ready, retry
-                                    continue;
-                                }
+                            } else {
+                                tracing::warn!("Client tried to send input but no PTY exists");
                             }
                         }
                     }
@@ -977,6 +1050,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::broadcast;
 
     #[test]
     fn test_detach_char_parsing() {
@@ -994,6 +1068,112 @@ mod tests {
         // Test invalid formats
         assert!(parse_detach_char("^too_long").is_err());
         assert!(parse_detach_char("").is_err());
+    }
+
+    #[test]
+    fn test_create_new_pty_with_bash() {
+        // This test verifies that PTY creation works
+        // Note: This spawns a real bash process, so we need to be careful
+        let result = create_new_pty_with_bash();
+        assert!(result.is_ok(), "Should be able to create PTY with bash");
+
+        let (pty_master, child_pid) = result.unwrap();
+
+        // Verify we got valid file descriptor and PID
+        assert!(
+            pty_master.as_raw_fd() > 0,
+            "PTY master should have valid fd"
+        );
+        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+        // Clean up - kill the child process
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+    }
+
+    #[tokio::test]
+    async fn test_pty_lifecycle() {
+        // Test that PTY state management works correctly
+        let (_tx, _) = broadcast::channel::<Vec<u8>>(1024);
+        let pty_async: Arc<Mutex<Option<Arc<AsyncFd<RawFd>>>>> = Arc::new(Mutex::new(None));
+
+        // Initially no PTY should exist
+        {
+            let pty_guard = pty_async.lock().await;
+            assert!(pty_guard.is_none(), "Initially no PTY should exist");
+        }
+
+        // Create a PTY
+        let (pty_master, child_pid) = create_new_pty_with_bash().unwrap();
+        let pty_master_fd = pty_master.as_raw_fd();
+
+        // Make it non-blocking
+        nix::fcntl::fcntl(
+            pty_master_fd,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .unwrap();
+
+        let pty_async_fd = Arc::new(AsyncFd::new(pty_master_fd).unwrap());
+
+        // Store in shared state
+        {
+            let mut pty_guard = pty_async.lock().await;
+            *pty_guard = Some(pty_async_fd.clone());
+        }
+
+        // Verify PTY exists
+        {
+            let pty_guard = pty_async.lock().await;
+            assert!(pty_guard.is_some(), "PTY should exist after creation");
+        }
+
+        // Clean up
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+
+        // Clear PTY state (simulating shell exit)
+        {
+            let mut pty_guard = pty_async.lock().await;
+            *pty_guard = None;
+        }
+
+        // Verify PTY is cleared
+        {
+            let pty_guard = pty_async.lock().await;
+            assert!(
+                pty_guard.is_none(),
+                "PTY should be cleared after shell exit"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pty_respawn_concept() {
+        // Test the core concept: we can create multiple PTYs sequentially
+
+        // Create first PTY
+        let result1 = create_new_pty_with_bash();
+        assert!(result1.is_ok(), "First PTY creation should succeed");
+        let (pty1, child1) = result1.unwrap();
+        let fd1 = pty1.as_raw_fd();
+
+        // Kill the first child
+        let _ = nix::sys::signal::kill(child1, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child1, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+
+        // Create second PTY (this simulates respawn)
+        let result2 = create_new_pty_with_bash();
+        assert!(result2.is_ok(), "Second PTY creation should succeed");
+        let (pty2, child2) = result2.unwrap();
+        let fd2 = pty2.as_raw_fd();
+
+        // They should have different file descriptors
+        assert_ne!(fd1, fd2, "New PTY should have different fd");
+
+        // Clean up second child
+        let _ = nix::sys::signal::kill(child2, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child2, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
     }
 
     #[test]
