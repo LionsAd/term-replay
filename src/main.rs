@@ -1240,7 +1240,7 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Server {
             socket_name,
             command,
@@ -1265,7 +1265,14 @@ async fn main() -> Result<()> {
             let session_name = socket_name.unwrap_or_else(|| "term-replay".to_string());
             client_main(detach_byte, &session_name).await
         }
-    }
+    };
+
+    // Tokio runtime sometimes hangs during shutdown despite proper cleanup
+    // Force exit to avoid waiting indefinitely
+    std::process::exit(match result {
+        Ok(()) => 0,
+        Err(_) => 1,
+    });
 }
 
 #[cfg(test)]
