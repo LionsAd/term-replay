@@ -19,6 +19,8 @@ serde_json = { workspace = true }
 tower = { workspace = true }
 futures-util = "0.3"
 chrono = { workspace = true }
+smux = { workspace = true }
+libc = { workspace = true }
 
 # Local crates
 term-protocol = { path = "../term-protocol" }

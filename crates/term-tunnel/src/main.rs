@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing;
 
@@ -282,16 +283,22 @@ async fn run_tunnel_mode(
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
     tracing::info!("🔌 Tunnel socket listening at: {}", socket_path.display());
 
-    // Create smux session from PTY
+    // Create smux session from PTY with keep-alive configuration
     let pty_stream = create_pty_stream(pty_async).await?;
-    let session = smux::Session::server(pty_stream, smux::Config::default()).await?;
-    tracing::info!("🎯 Created smux server session");
+    let mut config = smux::Config::default();
 
-    // Handle both Unix socket connections AND smux streams concurrently
+    // Try to configure keep-alive (exact API to be determined by compiler errors)
+    // config.keep_alive_interval = std::time::Duration::from_secs(30);
+    // config.keep_alive_timeout = std::time::Duration::from_secs(90);
+
+    let session = Arc::new(smux::Session::client(pty_stream, config).await?);
+    tracing::info!("🎯 Created smux client session");
+
+    // Handle Unix socket connections
     let mut connection_id = 0;
     loop {
         tokio::select! {
-            // Accept Unix socket connections
+            // Accept Unix socket connections and create smux streams for them
             result = listener.accept() => {
                 match result {
                     Ok((unix_stream, _)) => {
@@ -299,36 +306,15 @@ async fn run_tunnel_mode(
                         tracing::info!("🔌 New Unix socket connection #{}", connection_id);
 
                         let conn_id = connection_id;
+                        let session_clone = Arc::clone(&session);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_unix_connection(unix_stream, conn_id).await {
+                            if let Err(e) = handle_unix_connection(unix_stream, &session_clone, conn_id).await {
                                 tracing::error!("Unix connection #{} error: {}", conn_id, e);
                             }
                         });
                     }
                     Err(e) => {
                         tracing::error!("Failed to accept Unix connection: {}", e);
-                    }
-                }
-            }
-
-            // Accept new smux streams from the session (ORIGINAL UNCHANGED)
-            result = session.accept_stream() => {
-                match result {
-                    Ok(smux_stream) => {
-                        connection_id += 1;
-                        tracing::info!("📡 New smux stream #{}", connection_id);
-
-                        // Handle this stream in a separate task
-                        let conn_id = connection_id;
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_smux_stream(smux_stream, conn_id).await {
-                                tracing::error!("Smux stream #{} error: {}", conn_id, e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to accept smux stream: {}", e);
-                        break;
                     }
                 }
             }
@@ -357,58 +343,51 @@ async fn create_pty_stream(
     Ok(PtyStream::new(pty_async))
 }
 
-/// Handle a Unix socket connection - for now just echo back what we receive
+/// Handle a Unix socket connection by opening a smux stream and bridging it
 async fn handle_unix_connection(
-    mut unix_stream: tokio::net::UnixStream,
+    unix_stream: tokio::net::UnixStream,
+    session: &Arc<smux::Session>,
     conn_id: u32,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     tracing::info!("🌊 Handling Unix connection #{}", conn_id);
 
-    let mut buffer = [0u8; 4096];
-    loop {
-        match unix_stream.read(&mut buffer).await {
-            Ok(0) => {
-                tracing::info!("🔚 Connection #{} closed by client", conn_id);
-                break;
+    // Open a smux stream to the remote side
+    let smux_stream = session.open_stream().await?;
+    tracing::info!("📡 Opened smux stream #{} for Unix connection", conn_id);
+
+    // Split both streams for bidirectional forwarding
+    let (mut unix_reader, mut unix_writer) = tokio::io::split(unix_stream);
+    let (mut smux_reader, mut smux_writer) = tokio::io::split(smux_stream);
+
+    // Forward Unix socket -> smux stream
+    let conn_id_clone = conn_id;
+    let unix_to_smux = tokio::spawn(async move {
+        match tokio::io::copy(&mut unix_reader, &mut smux_writer).await {
+            Ok(bytes) => {
+                tracing::debug!("Unix->Smux #{}: {} bytes forwarded", conn_id_clone, bytes)
             }
-            Ok(n) => {
-                tracing::trace!("📡 Connection #{}: received {} bytes", conn_id, n);
-                // For now, just echo back what we received
-                if let Err(e) = unix_stream.write_all(&buffer[..n]).await {
-                    tracing::error!("Connection #{} write error: {}", conn_id, e);
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::error!("Connection #{} read error: {}", conn_id, e);
-                break;
-            }
+            Err(e) => tracing::debug!("Unix->Smux #{} ended: {}", conn_id_clone, e),
         }
+    });
+
+    // Forward smux stream -> Unix socket
+    let conn_id_clone = conn_id;
+    let smux_to_unix = tokio::spawn(async move {
+        match tokio::io::copy(&mut smux_reader, &mut unix_writer).await {
+            Ok(bytes) => {
+                tracing::debug!("Smux->Unix #{}: {} bytes forwarded", conn_id_clone, bytes)
+            }
+            Err(e) => tracing::debug!("Smux->Unix #{} ended: {}", conn_id_clone, e),
+        }
+    });
+
+    // Wait for either direction to complete
+    tokio::select! {
+        _ = unix_to_smux => {}
+        _ = smux_to_unix => {}
     }
 
-    tracing::info!("🔚 Connection #{} handler finished", conn_id);
-    Ok(())
-}
-
-/// Handle a single smux stream (ORIGINAL FUNCTION RESTORED)
-async fn handle_smux_stream(_smux_stream: smux::Stream, conn_id: u32) -> Result<()> {
-    tracing::info!("🌊 Starting stream handler for smux stream #{}", conn_id);
-
-    // For now, just echo data back to demonstrate the stream is working
-    // In a real implementation, this would connect to the Unix socket
-    // and forward data bidirectionally
-
-    tracing::info!(
-        "📡 Smux stream #{} active - placeholder implementation",
-        conn_id
-    );
-
-    // Keep the stream alive briefly for testing
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-    tracing::info!("🔚 Smux stream #{} closed", conn_id);
+    tracing::info!("🔚 Connection #{} bridge finished", conn_id);
     Ok(())
 }
 

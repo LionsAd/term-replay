@@ -11,11 +11,12 @@ use axum::{
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use std::os::fd::AsRawFd;
 use std::{
     io::{self, Write},
     time::SystemTime,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::{net::UnixStream, signal};
 use tracing;
 
@@ -47,8 +48,27 @@ pub async fn run_tunnel_server(custom_command: Option<&str>) -> Result<()> {
     // Phase 1: Emit handshake sequence to establish tunnel
     emit_handshake()?;
 
-    // Phase 2: Start HTTP/WebSocket server
-    start_http_server(custom_command).await?;
+    // Phase 2: Capture original stdout BEFORE redirecting it
+    let original_stdout_fd = unsafe { libc::dup(1) }; // Duplicate stdout fd
+
+    // CRITICAL: After handshake, redirect all logs to a file to avoid interfering with smux
+    setup_file_logging()?;
+
+    // Start HTTP/WebSocket server in background
+    let custom_command_owned = custom_command.map(|s| s.to_string());
+    let http_server_task = tokio::spawn(start_http_server(custom_command_owned));
+
+    // Start smux handler with access to original stdout
+    let smux_task = tokio::spawn(handle_stdin_smux_streams_with_fd(original_stdout_fd));
+
+    tokio::select! {
+        result = http_server_task => {
+            if let Err(_) = result {}
+        }
+        result = smux_task => {
+            if let Err(_) = result {}
+        }
+    }
 
     tracing::info!("🚇 term-tunnel-server exiting");
     Ok(())
@@ -67,12 +87,171 @@ fn emit_handshake() -> Result<()> {
     Ok(())
 }
 
+/// Redirect stdout/stderr to /dev/null after handshake to avoid interfering with smux channel
+fn setup_file_logging() -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+
+    // Open /dev/null for writing
+    let dev_null = OpenOptions::new().write(true).open("/dev/null")?;
+    let dev_null_fd = dev_null.as_raw_fd();
+
+    // Redirect stdout (fd 1) to /dev/null
+    unsafe {
+        libc::dup2(dev_null_fd, 1);
+    }
+
+    // Redirect stderr (fd 2) to /dev/null
+    unsafe {
+        libc::dup2(dev_null_fd, 2);
+    }
+
+    // Note: stdin (fd 0) is left untouched as it's used for smux communication
+
+    Ok(())
+}
+
+/// Handle incoming smux streams from stdin and forward them to localhost HTTP server
+async fn handle_stdin_smux_streams_with_fd(original_stdout_fd: i32) -> Result<()> {
+    use tokio::io::stdin;
+
+    // Create a wrapper for stdin that implements AsyncRead + AsyncWrite
+    // Use the captured stdout fd before redirection
+    let stdin_stream = StdinWrapper::new_with_fd(stdin(), original_stdout_fd)?;
+
+    // Configure smux server (not client!) - we accept connections from term-tunnel
+    let config = smux::Config::default();
+
+    // Create smux server session from stdin - term-tunnel connects to us as client
+    let session = smux::Session::server(stdin_stream, config).await?;
+
+    // Accept incoming streams from term-tunnel and forward to HTTP server
+    let mut stream_id = 0;
+    while let Ok(smux_stream) = session.accept_stream().await {
+        stream_id += 1;
+
+        // Handle each stream in a separate task
+        tokio::spawn(async move {
+            // Errors are silently ignored to avoid corrupting smux protocol
+            if let Err(_) = forward_smux_to_http_server(smux_stream, stream_id).await {}
+        });
+    }
+
+    Ok(())
+}
+
+/// Forward a smux stream to the local HTTP server
+async fn forward_smux_to_http_server(smux_stream: smux::Stream, _stream_id: u32) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Connect to local HTTP server
+    let http_stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
+
+    // Split both streams for bidirectional forwarding
+    let (mut smux_reader, mut smux_writer) = tokio::io::split(smux_stream);
+    let (mut http_reader, mut http_writer) = tokio::io::split(http_stream);
+
+    // Forward smux -> HTTP
+    let forward_to_http = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut smux_reader, &mut http_writer).await;
+    });
+
+    // Forward HTTP -> smux
+    let forward_to_smux = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut http_reader, &mut smux_writer).await;
+    });
+
+    // Wait for either direction to complete
+    tokio::select! {
+        _ = forward_to_http => {}
+        _ = forward_to_smux => {}
+    }
+
+    Ok(())
+}
+
+/// Wrapper to make stdin work as AsyncRead + AsyncWrite for smux
+struct StdinWrapper {
+    stdin: tokio::io::Stdin,
+    stdout_fd: tokio::io::unix::AsyncFd<i32>,
+}
+
+impl StdinWrapper {
+    fn new_with_fd(stdin: tokio::io::Stdin, original_stdout_fd: i32) -> std::io::Result<Self> {
+        // Use the captured original stdout file descriptor
+        let stdout_fd = tokio::io::unix::AsyncFd::new(original_stdout_fd)?;
+        Ok(Self { stdin, stdout_fd })
+    }
+}
+
+impl AsyncRead for StdinWrapper {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for StdinWrapper {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        // Use the raw file descriptor with AsyncFd
+        let mut guard = match self.stdout_fd.poll_write_ready(cx) {
+            std::task::Poll::Ready(Ok(guard)) => guard,
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+
+        match guard.try_io(|inner| {
+            let fd = inner.as_raw_fd();
+            unsafe {
+                let result = libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len());
+                if result == -1 {
+                    let errno = *libc::__error();
+                    if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                        return Err(std::io::Error::from_raw_os_error(errno));
+                    } else {
+                        return Err(std::io::Error::from_raw_os_error(errno));
+                    }
+                }
+                Ok(result as usize)
+            }
+        }) {
+            Ok(Ok(n)) => std::task::Poll::Ready(Ok(n)),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => std::task::Poll::Pending,
+            Ok(Err(e)) => std::task::Poll::Ready(Err(e)),
+            Err(_) => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        // For raw file descriptors, flush is a no-op
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        // For raw file descriptors, shutdown is a no-op
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 /// Start the HTTP/WebSocket server
-async fn start_http_server(custom_command: Option<&str>) -> Result<()> {
+async fn start_http_server(custom_command: Option<String>) -> Result<()> {
     tracing::info!("🌐 Starting HTTP/WebSocket server on localhost:8080");
 
     // Create the HTTP router
-    let app = create_app_router(custom_command).await;
+    let app = create_app_router(custom_command.as_deref()).await;
 
     // Start the server in a background task
     let server_handle = tokio::spawn(async move {
