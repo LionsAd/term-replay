@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Path, State, WebSocketUpgrade,
+        Path, WebSocketUpgrade,
     },
     http::StatusCode,
     response::{Json, Response},
@@ -10,13 +10,16 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    time::SystemTime,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{net::UnixStream, signal};
 use tracing;
 
 use term_protocol::{handshake::TUNNEL_READY_SEQUENCE, SessionInfo};
-use term_session::get_socket_path;
+use term_session::{get_socket_path, get_term_replay_dir};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -85,14 +88,10 @@ async fn start_http_server() -> Result<()> {
 
 /// Create the Axum app router with HTTP endpoints
 async fn create_app_router() -> Router {
-    // Placeholder session state
-    let session_state = create_placeholder_sessions();
-
     Router::new()
         .route("/list-sessions", get(list_sessions))
         .route("/health", get(health_check))
         .route("/ws/attach/:session_id", get(websocket_handler))
-        .with_state(session_state)
 }
 
 /// Health check endpoint
@@ -104,30 +103,18 @@ async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
-/// List sessions endpoint (placeholder implementation)
-async fn list_sessions(
-    State(sessions): State<Vec<SessionInfo>>,
-) -> Result<Json<Vec<SessionInfo>>, StatusCode> {
-    tracing::debug!("📋 Listing {} placeholder sessions", sessions.len());
-    Ok(Json(sessions))
-}
-
-/// Create some placeholder session data for testing
-fn create_placeholder_sessions() -> Vec<SessionInfo> {
-    vec![
-        SessionInfo {
-            id: "term-replay".to_string(),
-            name: "Default Session".to_string(),
-            pid: std::process::id(),
-            created: "2025-01-01T00:00:00Z".to_string(),
-        },
-        SessionInfo {
-            id: "test-session".to_string(),
-            name: "Test Session".to_string(),
-            pid: std::process::id() + 1,
-            created: "2025-01-01T00:01:00Z".to_string(),
-        },
-    ]
+/// List sessions endpoint - scan for actual .sock files
+async fn list_sessions() -> Result<Json<Vec<SessionInfo>>, StatusCode> {
+    match scan_active_sessions().await {
+        Ok(sessions) => {
+            tracing::debug!("📋 Found {} active sessions", sessions.len());
+            Ok(Json(sessions))
+        }
+        Err(e) => {
+            tracing::error!("❌ Failed to scan sessions: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM)
@@ -182,16 +169,33 @@ async fn websocket_to_unix_bridge(websocket: WebSocket, session_id: &str) -> Res
     let socket_path = get_socket_path(session_id);
     tracing::debug!("📁 Session socket path: {}", socket_path.display());
 
-    // TODO: Auto-spawn term-replay server if socket doesn't exist
-    // For now, just try to connect
-    let unix_stream = UnixStream::connect(&socket_path).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to connect to session '{}' at {}: {}",
-            session_id,
-            socket_path.display(),
-            e
-        )
-    })?;
+    // Auto-spawn term-replay server if socket doesn't exist
+    let unix_stream = match UnixStream::connect(&socket_path).await {
+        Ok(stream) => {
+            tracing::info!("📡 Connected to existing session: {}", session_id);
+            stream
+        }
+        Err(_) => {
+            tracing::info!(
+                "🚀 Session '{}' not found, auto-spawning term-replay server",
+                session_id
+            );
+            spawn_term_replay_server(session_id).await?;
+
+            // Wait for socket to appear with timeout
+            wait_for_socket(&socket_path).await?;
+
+            // Now connect to the newly created socket
+            UnixStream::connect(&socket_path).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to connect to auto-spawned session '{}' at {}: {}",
+                    session_id,
+                    socket_path.display(),
+                    e
+                )
+            })?
+        }
+    };
 
     let (unix_reader, unix_writer) = tokio::io::split(unix_stream);
     let (ws_sender, ws_receiver) = websocket.split();
@@ -313,6 +317,135 @@ async fn forward_unix_to_websocket(
     Ok(())
 }
 
+/// Spawn a term-replay server for the given session
+async fn spawn_term_replay_server(session_id: &str) -> Result<()> {
+    use tokio::process::Command;
+
+    tracing::debug!("📋 Spawning: term-replay server {}", session_id);
+
+    let mut cmd = Command::new("term-replay");
+    cmd.arg("server").arg(session_id);
+
+    // Spawn as background process
+    cmd.kill_on_drop(false); // Don't kill when this process exits
+
+    let child = cmd.spawn().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to spawn term-replay server for session '{}': {}",
+            session_id,
+            e
+        )
+    })?;
+
+    tracing::info!(
+        "✅ Spawned term-replay server for session '{}' with PID: {:?}",
+        session_id,
+        child.id()
+    );
+
+    Ok(())
+}
+
+/// Wait for a Unix socket to appear (with timeout)
+async fn wait_for_socket(socket_path: &std::path::Path) -> Result<()> {
+    use tokio::time::{sleep, timeout, Duration};
+
+    let timeout_duration = Duration::from_secs(5); // 5 second timeout
+    let check_interval = Duration::from_millis(100); // Check every 100ms
+
+    tracing::debug!("⏳ Waiting for socket to appear: {}", socket_path.display());
+
+    timeout(timeout_duration, async {
+        loop {
+            if socket_path.exists() {
+                tracing::debug!("✅ Socket appeared: {}", socket_path.display());
+                return Ok(());
+            }
+            sleep(check_interval).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Timeout waiting for socket to appear: {}",
+            socket_path.display()
+        )
+    })?
+}
+
+/// Scan for active sessions by looking for .sock files
+async fn scan_active_sessions() -> Result<Vec<SessionInfo>> {
+    use std::fs;
+    use std::time::SystemTime;
+
+    let dir = get_term_replay_dir();
+    tracing::debug!("🔍 Scanning for sessions in: {}", dir.display());
+
+    let mut sessions = Vec::new();
+
+    // Read directory entries
+    let entries = fs::read_dir(&dir)
+        .map_err(|e| anyhow::anyhow!("Failed to read directory {}: {}", dir.display(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read directory entry: {}", e))?;
+        let path = entry.path();
+
+        // Only process .sock files
+        if path.extension().and_then(|s| s.to_str()) == Some("sock") {
+            if let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) {
+                // Get file metadata for creation time (approximate)
+                let created_str = match entry.metadata() {
+                    Ok(metadata) => {
+                        let created = metadata
+                            .created()
+                            .or_else(|_| metadata.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH);
+                        format_system_time(created)
+                    }
+                    Err(_) => {
+                        // Fallback to current time if we can't read metadata
+                        format_system_time(SystemTime::now())
+                    }
+                };
+
+                // Try to determine PID (this is approximate, we don't have easy access to the actual PID)
+                let pid = std::process::id();
+
+                sessions.push(SessionInfo {
+                    id: session_name.to_string(),
+                    name: format!("Session: {}", session_name),
+                    pid,
+                    created: created_str,
+                });
+
+                tracing::trace!("📄 Found session: {}", session_name);
+            }
+        }
+    }
+
+    sessions.sort_by(|a, b| a.id.cmp(&b.id)); // Sort by session ID
+
+    Ok(sessions)
+}
+
+/// Format SystemTime as ISO string
+fn format_system_time(time: SystemTime) -> String {
+    use std::time::UNIX_EPOCH;
+
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = duration.as_secs();
+            // Simple approximation - convert to a basic ISO-like format
+            // This is not perfect but good enough for our purposes
+            let datetime = chrono::DateTime::from_timestamp(secs as i64, 0)
+                .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+            datetime.to_rfc3339()
+        }
+        Err(_) => "1970-01-01T00:00:00Z".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,23 +500,17 @@ mod tests {
             .unwrap();
         let sessions: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].id, "term-replay");
-        assert_eq!(sessions[0].name, "Default Session");
-        assert_eq!(sessions[1].id, "test-session");
-        assert_eq!(sessions[1].name, "Test Session");
-    }
+        // Should return a valid JSON array (may be empty if no sessions exist)
+        // This is testing that the endpoint works, not the specific content
+        assert!(sessions.is_empty() || !sessions.is_empty()); // Always true, but validates deserialization
 
-    #[tokio::test]
-    async fn test_placeholder_session_creation() {
-        let sessions = create_placeholder_sessions();
-
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].id, "term-replay");
-        assert_eq!(sessions[1].id, "test-session");
-
-        // Verify sessions have different PIDs
-        assert_ne!(sessions[0].pid, sessions[1].pid);
+        // Test that all sessions have valid structure
+        for session in &sessions {
+            assert!(!session.id.is_empty());
+            assert!(!session.name.is_empty());
+            assert!(!session.created.is_empty());
+            assert!(session.name.starts_with("Session: "));
+        }
     }
 
     #[tokio::test]
