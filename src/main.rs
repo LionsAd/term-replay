@@ -262,8 +262,19 @@ fn apply_window_size_to_pty(pty_fd: RawFd, rows: u16, cols: u16) -> Result<()> {
 }
 
 /// Create a new PTY with bash process - returns (pty_master, child_pid)
-fn create_new_pty_with_bash() -> Result<(std::os::unix::io::OwnedFd, nix::unistd::Pid)> {
-    // Create a completely new PTY since the old one is dead
+fn create_new_pty_with_command(
+    command: &[String],
+) -> Result<(std::os::unix::io::OwnedFd, nix::unistd::Pid)> {
+    // Validate command
+    if command.is_empty() {
+        anyhow::bail!("Command cannot be empty");
+    }
+
+    // Join command parts into a single string for bash -c
+    let cmd_string = command.join(" ");
+    tracing::info!("Creating PTY with command: {}", cmd_string);
+
+    // Create a completely new PTY
     let pty_master = match unsafe { forkpty(None, None)? } {
         ForkptyResult::Parent { master, child } => {
             tracing::info!(
@@ -274,12 +285,19 @@ fn create_new_pty_with_bash() -> Result<(std::os::unix::io::OwnedFd, nix::unistd
             (master, child)
         }
         ForkptyResult::Child => {
-            // In child process, execute bash
-            let shell_path = CString::new("/bin/bash")?;
-            let shell_arg0 = CString::new("-bash")?;
-            let args = [shell_arg0.as_c_str()];
+            // In child process, execute bash -c "command"
+            let bash_path = CString::new("/bin/bash")?;
+            let bash_name = CString::new("bash")?;
+            let c_flag = CString::new("-c")?;
+            let command_cstr = CString::new(cmd_string)?;
 
-            unistd::execvp(&shell_path, &args)?;
+            let args = [
+                bash_name.as_c_str(),
+                c_flag.as_c_str(),
+                command_cstr.as_c_str(),
+            ];
+
+            unistd::execvp(&bash_path, &args)?;
             unreachable!();
         }
     };
@@ -640,6 +658,9 @@ enum Commands {
         /// Set the socket name (default: term-replay). Creates {name}.sock and {name}.log
         #[arg(short = 'S', long = "socket-name", value_name = "NAME")]
         socket_name: Option<String>,
+        /// Custom command to run instead of bash (default: ["bash"])
+        #[arg(value_name = "COMMAND")]
+        command: Vec<String>,
     },
     /// Attach to the persistent terminal server
     Client {
@@ -653,7 +674,7 @@ enum Commands {
 }
 
 // SERVER LOGIC
-async fn server_main(session_name: &str) -> Result<()> {
+async fn server_main(session_name: &str, command: &[String]) -> Result<()> {
     // Initialize signal manager for server mode
     let signal_manager = SignalManager::new(false);
     signal_manager.setup_server_signals()?;
@@ -792,13 +813,13 @@ async fn server_main(session_name: &str) -> Result<()> {
                                 };
 
                                 if still_needs_pty {
-                                    tracing::info!("✅ Confirmed PTY creation needed, creating new PTY with bash...");
+                                    tracing::info!("✅ Confirmed PTY creation needed, creating new PTY with command: {}", command.join(" "));
 
-                                    // Create new PTY with bash
-                                    match create_new_pty_with_bash() {
+                                    // Create new PTY with custom command
+                                    match create_new_pty_with_command(command) {
                                         Ok((pty_master, child_pid)) => {
                                             let pty_master_fd = pty_master.as_raw_fd();
-                                            tracing::info!("🎯 SUCCESS: Created PTY with bash, PID: {}, FD: {}",
+                                            tracing::info!("🎯 SUCCESS: Created PTY with command, PID: {}, FD: {}",
                                                 child_pid, pty_master_fd);
 
                                             // Make PTY non-blocking
@@ -1202,9 +1223,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server { socket_name } => {
+        Commands::Server {
+            socket_name,
+            command,
+        } => {
             let session_name = socket_name.unwrap_or_else(|| "term-replay".to_string());
-            server_main(&session_name).await
+            let cmd = if command.is_empty() {
+                vec!["bash".to_string(), "-l".to_string()]
+            } else {
+                command
+            };
+            server_main(&session_name, &cmd).await
         }
         Commands::Client {
             detach_char,
@@ -1653,4 +1682,147 @@ fn test_session_name_with_special_characters() {
 
     let socket_path = get_socket_path("dev");
     assert_eq!(socket_path, PathBuf::from("/tmp/dev.sock"));
+}
+
+#[test]
+fn test_create_pty_with_custom_command() {
+    // Test creating PTY with a simple command that should exist on most systems
+    let command = vec!["echo".to_string(), "hello".to_string()];
+    let result = create_new_pty_with_command(&command);
+
+    assert!(
+        result.is_ok(),
+        "Should be able to create PTY with echo command"
+    );
+
+    if let Ok((pty_master, child_pid)) = result {
+        // Verify we got valid file descriptor and PID
+        assert!(
+            pty_master.as_raw_fd() > 0,
+            "PTY master should have valid fd"
+        );
+        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+        // Clean up the child process
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+    }
+}
+
+#[test]
+fn test_create_pty_with_invalid_command() {
+    // Test creating PTY with a command that doesn't exist
+    // With bash -c, the PTY will be created but the command will fail inside
+    // This is actually the correct behavior - the error will be visible to the client
+    let command = vec!["nonexistent_command_12345".to_string()];
+    let result = create_new_pty_with_command(&command);
+
+    // PTY creation should succeed, but the command will fail and client will see the error
+    assert!(
+        result.is_ok(),
+        "PTY creation should succeed, command error will be visible to client"
+    );
+
+    if let Ok((pty_master, child_pid)) = result {
+        // Verify we got valid file descriptor and PID
+        assert!(
+            pty_master.as_raw_fd() > 0,
+            "PTY master should have valid fd"
+        );
+        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+        // Clean up the child process
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+    }
+}
+
+#[test]
+fn test_create_pty_with_empty_command() {
+    // Test creating PTY with empty command
+    let command = vec![];
+    let result = create_new_pty_with_command(&command);
+
+    assert!(result.is_err(), "Should fail with empty command");
+    assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+}
+
+#[test]
+fn test_create_pty_with_command_arguments() {
+    // Test creating PTY with command and arguments (bash -c "ls -la")
+    let command = vec!["ls".to_string(), "-la".to_string()];
+    let result = create_new_pty_with_command(&command);
+
+    assert!(
+        result.is_ok(),
+        "Should be able to create PTY with ls command"
+    );
+
+    if let Ok((pty_master, child_pid)) = result {
+        // Verify we got valid file descriptor and PID
+        assert!(
+            pty_master.as_raw_fd() > 0,
+            "PTY master should have valid fd"
+        );
+        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+        // Clean up the child process
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+    }
+}
+
+#[test]
+fn test_create_pty_with_complex_command() {
+    // Test creating PTY with complex command that includes quotes and pipes
+    let command = vec![
+        "echo".to_string(),
+        "Hello World".to_string(),
+        "|".to_string(),
+        "cat".to_string(),
+    ];
+    let result = create_new_pty_with_command(&command);
+
+    assert!(
+        result.is_ok(),
+        "Should be able to create PTY with complex command"
+    );
+
+    if let Ok((pty_master, child_pid)) = result {
+        // Verify we got valid file descriptor and PID
+        assert!(
+            pty_master.as_raw_fd() > 0,
+            "PTY master should have valid fd"
+        );
+        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+        // Clean up the child process
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+    }
+}
+
+// Helper function for tests that need bash PTY
+fn create_new_pty_with_bash() -> Result<(std::os::unix::io::OwnedFd, nix::unistd::Pid)> {
+    create_new_pty_with_command(&["bash".to_string()])
+}
+
+#[test]
+fn test_backward_compatibility_bash_wrapper() {
+    // Test that the bash wrapper still works for tests
+    let result = create_new_pty_with_bash();
+    assert!(result.is_ok(), "Bash wrapper should still work for tests");
+
+    if let Ok((pty_master, child_pid)) = result {
+        // Verify we got valid file descriptor and PID
+        assert!(
+            pty_master.as_raw_fd() > 0,
+            "PTY master should have valid fd"
+        );
+        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+        // Clean up the child process
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+    }
 }
