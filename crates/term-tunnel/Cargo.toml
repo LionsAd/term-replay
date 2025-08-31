@@ -7,6 +7,10 @@ edition = "2021"
 name = "term-tunnel"
 path = "src/main.rs"
 
+[lib]
+name = "term_tunnel"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -16,6 +20,7 @@ tracing-subscriber = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 smux = { workspace = true }
+serde_json = { workspace = true }
 
 # Local crates
 term-core = { path = "../term-core" }

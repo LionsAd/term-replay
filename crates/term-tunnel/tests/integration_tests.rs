@@ -4,6 +4,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::timeout;
 
+// Import functions from main
+use term_tunnel::{resolve_term_replay_binary, run_tunnel_attach, run_tunnel_list};
+
 #[tokio::test]
 async fn test_tunnel_socket_creation() {
     // Test that term-tunnel creates Unix socket properly
@@ -176,4 +179,64 @@ async fn test_connection_cleanup() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_tunnel_attach_command() {
+    // Test that tunnel attach creates proxy socket properly
+    let tunnel_socket = "test-attach-cmd";
+    let session_name = "test-session-cmd";
+
+    // Clean up any existing socket
+    let proxy_socket_name = format!("{}-{}", tunnel_socket, session_name);
+    let proxy_socket_path = term_session::get_socket_path(&proxy_socket_name);
+    if proxy_socket_path.exists() {
+        std::fs::remove_file(&proxy_socket_path).unwrap();
+    }
+
+    // Start tunnel attach with disabled spawn in background
+    let attach_handle =
+        tokio::spawn(async move { run_tunnel_attach(tunnel_socket, session_name, Some("")).await });
+
+    // Give it time to create the socket
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify socket was created
+    let mut attempts = 0;
+    while !proxy_socket_path.exists() && attempts < 10 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+    assert!(proxy_socket_path.exists(), "Proxy socket was not created");
+
+    // Clean up
+    attach_handle.abort();
+    if proxy_socket_path.exists() {
+        std::fs::remove_file(&proxy_socket_path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_binary_resolution() {
+    // Test binary resolution function
+    let binary_path = resolve_term_replay_binary();
+    match binary_path {
+        Ok(path) => {
+            assert!(path.to_string_lossy().contains("term-replay"));
+        }
+        Err(e) => {
+            // Expected if term-replay binary is not in the same directory
+            assert!(e.to_string().contains("term-replay binary not found"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_tunnel_list_socket_not_found() {
+    // Test behavior when tunnel socket doesn't exist
+    let result = run_tunnel_list("nonexistent-tunnel-socket").await;
+    assert!(result.is_err());
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(error_msg.contains("Tunnel socket not found"));
 }

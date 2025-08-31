@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::os::unix::io::AsRawFd;
 use tokio::io::AsyncWriteExt;
 use tracing;
@@ -11,13 +11,33 @@ use term_session::get_socket_path;
 #[derive(Parser)]
 #[command(author, version, about = "Terminal tunnel client for remote sessions", long_about = None)]
 struct Cli {
-    /// Set the socket name (default: term-tunnel). Creates /tmp/{name}.sock
-    #[arg(short = 'S', long = "socket-name", value_name = "NAME")]
-    socket_name: Option<String>,
+    #[command(subcommand)]
+    command: Option<Commands>,
 
-    /// Custom command to run (default: login bash). Same logic as term-replay server.
-    #[arg(value_name = "COMMAND")]
-    command: Vec<String>,
+    /// Set the socket name (default: term-tunnel). Creates /tmp/{name}.sock
+    #[arg(short = 'S', long = "socket-name", value_name = "NAME", global = true)]
+    socket_name: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Attach to a remote session through tunnel
+    Attach {
+        /// Session to attach to (default: term-replay)
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// Custom command to spawn client. Use -c "" to disable auto-spawn, or omit -c for default behavior.
+        #[arg(short = 'c', long = "command")]
+        custom_command: Option<String>,
+    },
+    /// List available remote sessions through tunnel
+    List,
+    /// Start tunnel (legacy mode - default when no subcommand given)
+    Start {
+        /// Custom command to run (default: login bash). Same logic as term-replay server.
+        #[arg(value_name = "COMMAND")]
+        command: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -27,15 +47,27 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(log_level).init();
 
     let cli = Cli::parse();
-
     let socket_name = cli.socket_name.unwrap_or_else(|| "term-tunnel".to_string());
-    let command = if cli.command.is_empty() {
-        vec!["bash".to_string(), "-l".to_string()] // Same default as term-replay server
-    } else {
-        cli.command
-    };
 
-    run_tunnel_client(&socket_name, &command).await
+    match cli.command.unwrap_or(Commands::Start { command: vec![] }) {
+        Commands::Attach {
+            session,
+            custom_command,
+        } => {
+            let session_name = session.unwrap_or_else(|| "term-replay".to_string());
+            term_tunnel::run_tunnel_attach(&socket_name, &session_name, custom_command.as_deref())
+                .await
+        }
+        Commands::List => term_tunnel::run_tunnel_list(&socket_name).await,
+        Commands::Start { command } => {
+            let cmd = if command.is_empty() {
+                vec!["bash".to_string(), "-l".to_string()] // Same default as term-replay server
+            } else {
+                command
+            };
+            run_tunnel_client(&socket_name, &cmd).await
+        }
+    }
 }
 
 /// Main tunnel client implementation
