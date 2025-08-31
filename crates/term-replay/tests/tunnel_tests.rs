@@ -226,3 +226,61 @@ mod integration {
         }
     }
 }
+
+#[tokio::test]
+async fn test_auto_spawn_functionality() {
+    // Test binary resolution
+    let binary_path = term_replay::resolve_term_replay_binary();
+    // Should either find the binary or return a descriptive error
+    match binary_path {
+        Ok(path) => {
+            assert!(path.to_string_lossy().contains("term-replay"));
+        }
+        Err(e) => {
+            // Expected if term-replay binary is not in the same directory
+            assert!(e.to_string().contains("term-replay binary not found"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_tunnel_attach_with_disabled_spawn() {
+    // Test that -c "" disables auto-spawn
+    let tunnel_socket = "test-disabled-spawn";
+    let session_name = "test-session-disabled";
+
+    // Clean up any existing socket
+    let proxy_socket_name = format!("{}-{}", tunnel_socket, session_name);
+    let proxy_socket_path = term_session::get_socket_path(&proxy_socket_name);
+    if proxy_socket_path.exists() {
+        std::fs::remove_file(&proxy_socket_path).unwrap();
+    }
+
+    // Start tunnel attach with disabled spawn in background
+    let attach_handle = tokio::spawn(async move {
+        term_replay::run_tunnel_attach_with_client(
+            tunnel_socket,
+            session_name,
+            Some(""), // Empty string disables spawn
+        )
+        .await
+    });
+
+    // Give it time to create the socket
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify socket was created (indicating the proxy setup worked)
+    // Use a timeout to wait for socket creation
+    let mut attempts = 0;
+    while !proxy_socket_path.exists() && attempts < 10 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+    assert!(proxy_socket_path.exists(), "Proxy socket was not created");
+
+    // Clean up
+    attach_handle.abort();
+    if proxy_socket_path.exists() {
+        std::fs::remove_file(&proxy_socket_path).unwrap();
+    }
+}

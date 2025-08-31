@@ -2,13 +2,14 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Path, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
     },
     http::StatusCode,
     response::{Json, Response},
     routing::get,
     Router,
 };
+use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use std::{
     io::{self, Write},
@@ -21,24 +22,33 @@ use tracing;
 use term_protocol::{handshake::TUNNEL_READY_SEQUENCE, SessionInfo};
 use term_session::{get_socket_path, get_term_replay_dir};
 
+#[derive(Parser)]
+#[command(author, version, about = "Term tunnel server")]
+struct Args {
+    /// Custom command to spawn term-replay servers. Use -c "" to disable auto-spawn, or omit -c for default behavior.
+    #[arg(short = 'c', long = "command")]
+    custom_command: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::fmt().with_env_filter(log_level).init();
 
-    run_tunnel_server().await
+    let args = Args::parse();
+    run_tunnel_server(args.custom_command.as_deref()).await
 }
 
 /// Main tunnel server implementation
-pub async fn run_tunnel_server() -> Result<()> {
+pub async fn run_tunnel_server(custom_command: Option<&str>) -> Result<()> {
     tracing::info!("🚇 Starting term-tunnel-server");
 
     // Phase 1: Emit handshake sequence to establish tunnel
     emit_handshake()?;
 
-    // Phase 2: Start HTTP/WebSocket server (placeholder)
-    start_http_server().await?;
+    // Phase 2: Start HTTP/WebSocket server
+    start_http_server(custom_command).await?;
 
     tracing::info!("🚇 term-tunnel-server exiting");
     Ok(())
@@ -57,12 +67,12 @@ fn emit_handshake() -> Result<()> {
     Ok(())
 }
 
-/// Start the HTTP/WebSocket server (placeholder implementation)
-async fn start_http_server() -> Result<()> {
+/// Start the HTTP/WebSocket server
+async fn start_http_server(custom_command: Option<&str>) -> Result<()> {
     tracing::info!("🌐 Starting HTTP/WebSocket server on localhost:8080");
 
-    // Create the HTTP router with placeholder endpoints
-    let app = create_app_router().await;
+    // Create the HTTP router
+    let app = create_app_router(custom_command).await;
 
     // Start the server in a background task
     let server_handle = tokio::spawn(async move {
@@ -87,11 +97,23 @@ async fn start_http_server() -> Result<()> {
 }
 
 /// Create the Axum app router with HTTP endpoints
-async fn create_app_router() -> Router {
+async fn create_app_router(custom_command: Option<&str>) -> Router {
+    // Store custom command in app state
+    let command = custom_command.map(String::from);
+
     Router::new()
         .route("/list-sessions", get(list_sessions))
         .route("/health", get(health_check))
         .route("/ws/attach/:session_id", get(websocket_handler))
+        .with_state(AppState {
+            custom_command: command,
+        })
+}
+
+/// App state for passing custom command to handlers
+#[derive(Clone)]
+struct AppState {
+    custom_command: Option<String>,
 }
 
 /// Health check endpoint
@@ -143,20 +165,32 @@ async fn wait_for_shutdown() {
 }
 
 /// WebSocket endpoint handler
-async fn websocket_handler(Path(session_id): Path<String>, ws: WebSocketUpgrade) -> Response {
+async fn websocket_handler(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> Response {
     tracing::info!(
         "🔌 WebSocket connection request for session: {}",
         session_id
     );
 
-    ws.on_upgrade(move |socket| handle_websocket_connection(socket, session_id))
+    ws.on_upgrade(move |socket| {
+        handle_websocket_connection(socket, session_id, state.custom_command)
+    })
 }
 
 /// Handle WebSocket connection - bridge to Unix socket
-async fn handle_websocket_connection(websocket: axum::extract::ws::WebSocket, session_id: String) {
+async fn handle_websocket_connection(
+    websocket: axum::extract::ws::WebSocket,
+    session_id: String,
+    custom_command: Option<String>,
+) {
     tracing::info!("🌐 Starting WebSocket session: {}", session_id);
 
-    if let Err(e) = websocket_to_unix_bridge(websocket, &session_id).await {
+    if let Err(e) =
+        websocket_to_unix_bridge(websocket, &session_id, custom_command.as_deref()).await
+    {
         tracing::error!("❌ WebSocket session {} failed: {}", session_id, e);
     }
 
@@ -164,7 +198,11 @@ async fn handle_websocket_connection(websocket: axum::extract::ws::WebSocket, se
 }
 
 /// Bridge WebSocket to Unix socket (term-replay server)
-async fn websocket_to_unix_bridge(websocket: WebSocket, session_id: &str) -> Result<()> {
+async fn websocket_to_unix_bridge(
+    websocket: WebSocket,
+    session_id: &str,
+    custom_command: Option<&str>,
+) -> Result<()> {
     // Get the socket path for this session
     let socket_path = get_socket_path(session_id);
     tracing::debug!("📁 Session socket path: {}", socket_path.display());
@@ -177,13 +215,15 @@ async fn websocket_to_unix_bridge(websocket: WebSocket, session_id: &str) -> Res
         }
         Err(_) => {
             tracing::info!(
-                "🚀 Session '{}' not found, auto-spawning term-replay server",
-                session_id
+                "🚀 Session '{}' not found, auto-spawning server with command: {:?}",
+                session_id,
+                custom_command
             );
-            spawn_term_replay_server(session_id).await?;
+            term_tunnel_server::spawn_term_replay_server_with_command(session_id, custom_command)
+                .await?;
 
             // Wait for socket to appear with timeout
-            wait_for_socket(&socket_path).await?;
+            term_tunnel_server::wait_for_socket(&socket_path).await?;
 
             // Now connect to the newly created socket
             UnixStream::connect(&socket_path).await.map_err(|e| {
@@ -317,62 +357,6 @@ async fn forward_unix_to_websocket(
     Ok(())
 }
 
-/// Spawn a term-replay server for the given session
-async fn spawn_term_replay_server(session_id: &str) -> Result<()> {
-    use tokio::process::Command;
-
-    tracing::debug!("📋 Spawning: term-replay server {}", session_id);
-
-    let mut cmd = Command::new("term-replay");
-    cmd.arg("server").arg(session_id);
-
-    // Spawn as background process
-    cmd.kill_on_drop(false); // Don't kill when this process exits
-
-    let child = cmd.spawn().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to spawn term-replay server for session '{}': {}",
-            session_id,
-            e
-        )
-    })?;
-
-    tracing::info!(
-        "✅ Spawned term-replay server for session '{}' with PID: {:?}",
-        session_id,
-        child.id()
-    );
-
-    Ok(())
-}
-
-/// Wait for a Unix socket to appear (with timeout)
-async fn wait_for_socket(socket_path: &std::path::Path) -> Result<()> {
-    use tokio::time::{sleep, timeout, Duration};
-
-    let timeout_duration = Duration::from_secs(5); // 5 second timeout
-    let check_interval = Duration::from_millis(100); // Check every 100ms
-
-    tracing::debug!("⏳ Waiting for socket to appear: {}", socket_path.display());
-
-    timeout(timeout_duration, async {
-        loop {
-            if socket_path.exists() {
-                tracing::debug!("✅ Socket appeared: {}", socket_path.display());
-                return Ok(());
-            }
-            sleep(check_interval).await;
-        }
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Timeout waiting for socket to appear: {}",
-            socket_path.display()
-        )
-    })?
-}
-
 /// Scan for active sessions by looking for .sock files
 async fn scan_active_sessions() -> Result<Vec<SessionInfo>> {
     use std::fs;
@@ -455,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check_endpoint() {
-        let app = create_app_router().await;
+        let app = create_app_router(None).await;
 
         let response = app
             .oneshot(
@@ -481,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_endpoint() {
-        let app = create_app_router().await;
+        let app = create_app_router(None).await;
 
         let response = app
             .oneshot(
@@ -522,7 +506,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_endpoint() {
-        let app = create_app_router().await;
+        let app = create_app_router(None).await;
 
         let response = app
             .oneshot(

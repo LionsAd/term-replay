@@ -50,6 +50,9 @@ enum TunnelCommands {
         /// Session to attach to (default: term-replay)
         #[arg(value_name = "SESSION")]
         session: Option<String>,
+        /// Custom command to spawn client. Use -c "" to disable auto-spawn, or omit -c for default behavior.
+        #[arg(short = 'c', long = "command")]
+        custom_command: Option<String>,
     },
     /// List available remote sessions through tunnel
     List {
@@ -96,10 +99,16 @@ async fn main() -> Result<()> {
             TunnelCommands::Attach {
                 socket_name,
                 session,
+                custom_command,
             } => {
                 let tunnel_socket = socket_name.unwrap_or_else(|| "term-tunnel".to_string());
                 let session_name = session.unwrap_or_else(|| "term-replay".to_string());
-                run_tunnel_attach(&tunnel_socket, &session_name).await
+                term_replay::run_tunnel_attach_with_client(
+                    &tunnel_socket,
+                    &session_name,
+                    custom_command.as_deref(),
+                )
+                .await
             }
             TunnelCommands::List { socket_name } => {
                 let tunnel_socket = socket_name.unwrap_or_else(|| "term-tunnel".to_string());
@@ -109,122 +118,6 @@ async fn main() -> Result<()> {
     };
 
     result
-}
-
-/// Attach to a remote session through the tunnel by creating a local proxy socket
-async fn run_tunnel_attach(tunnel_socket: &str, session_name: &str) -> Result<()> {
-    use tokio::net::{UnixListener, UnixStream};
-
-    println!(
-        "🚇 Creating tunnel proxy for remote session: {}",
-        session_name
-    );
-    println!("📡 Tunnel socket: {}", tunnel_socket);
-
-    // Create a local socket for the client to connect to
-    let proxy_socket_name = format!("{}-{}", tunnel_socket, session_name);
-    let proxy_socket_path = term_session::get_socket_path(&proxy_socket_name);
-
-    // Remove existing socket if it exists
-    if proxy_socket_path.exists() {
-        std::fs::remove_file(&proxy_socket_path)?;
-    }
-
-    // Create Unix listener
-    let listener = UnixListener::bind(&proxy_socket_path)?;
-    println!(
-        "✅ Proxy socket created at: {}",
-        proxy_socket_path.display()
-    );
-    println!("🔌 Run: term-replay client -S {}", proxy_socket_name);
-    println!("⏳ Waiting for client connection...");
-
-    // Accept connections and proxy them
-    while let Ok((client_stream, _)) = listener.accept().await {
-        println!("📞 Client connected, establishing tunnel...");
-
-        // Connect to the tunnel socket for each client
-        let tunnel_path = term_session::get_socket_path(tunnel_socket);
-        if !tunnel_path.exists() {
-            eprintln!("❌ Tunnel socket not found: {}", tunnel_path.display());
-            continue;
-        }
-
-        match UnixStream::connect(&tunnel_path).await {
-            Ok(tunnel_stream) => {
-                tokio::spawn(handle_tunnel_proxy(
-                    client_stream,
-                    tunnel_stream,
-                    session_name.to_string(),
-                ));
-            }
-            Err(e) => {
-                eprintln!("❌ Failed to connect to tunnel: {}", e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle proxying between client and tunnel
-async fn handle_tunnel_proxy(
-    mut client_stream: tokio::net::UnixStream,
-    mut tunnel_stream: tokio::net::UnixStream,
-    session_name: String,
-) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    println!("🌉 Proxying connection for session: {}", session_name);
-
-    // Send WebSocket upgrade request to tunnel
-    let websocket_request = format!(
-        "GET /ws/attach/{} HTTP/1.1\r\n\
-         Host: localhost\r\n\
-         Connection: Upgrade\r\n\
-         Upgrade: websocket\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\r\n",
-        session_name
-    );
-
-    tunnel_stream
-        .write_all(websocket_request.as_bytes())
-        .await?;
-
-    // Read WebSocket upgrade response
-    let mut response_buffer = vec![0u8; 1024];
-    let n = tunnel_stream.read(&mut response_buffer).await?;
-    let response = String::from_utf8_lossy(&response_buffer[..n]);
-
-    if !response.contains("101 Switching Protocols") {
-        eprintln!("❌ Failed WebSocket upgrade: {}", response);
-        return Ok(());
-    }
-
-    println!("✅ WebSocket established, starting proxy...");
-
-    // Now just proxy data bidirectionally
-    let (mut client_read, mut client_write) = client_stream.split();
-    let (mut tunnel_read, mut tunnel_write) = tunnel_stream.split();
-
-    tokio::select! {
-        // Client -> Tunnel
-        result = tokio::io::copy(&mut client_read, &mut tunnel_write) => {
-            match result {
-                Ok(n) => println!("🔚 Client->Tunnel finished ({} bytes)", n),
-                Err(e) => eprintln!("❌ Client->Tunnel error: {}", e),
-            }
-        }
-        // Tunnel -> Client
-        result = tokio::io::copy(&mut tunnel_read, &mut client_write) => {
-            match result {
-                Ok(n) => println!("🔚 Tunnel->Client finished ({} bytes)", n),
-                Err(e) => eprintln!("❌ Tunnel->Client error: {}", e),
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// List available remote sessions through the tunnel
