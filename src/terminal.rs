@@ -8,7 +8,6 @@ use std::os::unix::io::RawFd;
 pub struct TerminalState {
     pub original_termios: Option<Termios>,
     pub raw_termios: Option<Termios>,
-    pub original_winsize: winsize,
     pub is_raw: bool,
 }
 
@@ -20,12 +19,9 @@ impl TerminalState {
             None
         };
 
-        let original_winsize = get_window_size(0)?;
-
         Ok(TerminalState {
             original_termios,
             raw_termios: None,
-            original_winsize,
             is_raw: false,
         })
     }
@@ -113,6 +109,7 @@ pub fn is_terminal(fd: RawFd) -> bool {
     unistd::isatty(fd).unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub fn get_window_size(fd: RawFd) -> io::Result<winsize> {
     let mut ws: winsize = unsafe { std::mem::zeroed() };
 
@@ -127,16 +124,6 @@ pub fn get_window_size(fd: RawFd) -> io::Result<winsize> {
     }
 
     Ok(ws)
-}
-
-pub fn set_window_size(fd: RawFd, ws: &winsize) -> io::Result<()> {
-    let result = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, ws) };
-
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

@@ -638,6 +638,7 @@ impl EscapeParser {
         actions
     }
 
+    #[allow(dead_code)]
     fn reset(&mut self) {
         self.state = ParseState::Normal;
         self.buffer.clear();
@@ -1588,241 +1589,241 @@ mod tests {
             ]
         );
     }
-}
 
-#[test]
-fn test_multiple_sequences_in_chunk() {
-    let mut parser = EscapeParser::new();
-
-    // Your actual sequence: ESC[2J ESC[3J ESC[H
-    let multi_seq = b"[2J[3J[H";
-
-    let actions = parser.parse(multi_seq);
-
-    println!("Multi-sequence - Parser state: {:?}", parser.state);
-    println!("Multi-sequence - Detected actions: {:?}", actions);
-
-    // Should detect the destructive clear
-    assert!(actions.contains(&SequenceAction::DestructiveClear));
-}
-
-#[test]
-fn test_path_generation_with_default_dir() {
-    // Test with default directory (/tmp)
-    unsafe {
-        std::env::remove_var("TERM_REPLAY_DIR");
+    // Helper function for tests that need bash PTY
+    fn create_new_pty_with_bash() -> Result<(std::os::unix::io::OwnedFd, nix::unistd::Pid)> {
+        create_new_pty_with_command(&["bash".to_string()])
     }
 
-    let socket_path = get_socket_path("test-session");
-    let log_path = get_log_path("test-session");
-    let debug_path = get_debug_raw_log_path("test-session");
-    let input_path = get_input_log_path("test-session");
+    #[test]
+    fn test_multiple_sequences_in_chunk() {
+        let mut parser = EscapeParser::new();
 
-    assert_eq!(socket_path, PathBuf::from("/tmp/test-session.sock"));
-    assert_eq!(log_path, PathBuf::from("/tmp/test-session.log"));
-    assert_eq!(debug_path, PathBuf::from("/tmp/test-session-raw.log"));
-    assert_eq!(input_path, PathBuf::from("/tmp/test-session-input.log"));
-}
+        // Your actual sequence: ESC[2J ESC[3J ESC[H
+        let multi_seq = b"\x1b[2J\x1b[3J\x1b[H";
 
-#[test]
-fn test_path_generation_with_custom_dir() {
-    // Test with custom directory via environment variable
-    unsafe {
-        std::env::set_var("TERM_REPLAY_DIR", "/var/run/user/1000");
+        let actions = parser.parse(multi_seq);
+
+        println!("Multi-sequence - Parser state: {:?}", parser.state);
+        println!("Multi-sequence - Detected actions: {:?}", actions);
+
+        // Should detect the destructive clear
+        assert!(actions.contains(&SequenceAction::DestructiveClear));
     }
 
-    let socket_path = get_socket_path("mysession");
-    let log_path = get_log_path("mysession");
-    let debug_path = get_debug_raw_log_path("mysession");
-    let input_path = get_input_log_path("mysession");
+    #[test]
+    fn test_path_generation_with_default_dir() {
+        // Test with default directory (/tmp)
+        unsafe {
+            std::env::remove_var("TERM_REPLAY_DIR");
+        }
 
-    assert_eq!(
-        socket_path,
-        PathBuf::from("/var/run/user/1000/mysession.sock")
-    );
-    assert_eq!(log_path, PathBuf::from("/var/run/user/1000/mysession.log"));
-    assert_eq!(
-        debug_path,
-        PathBuf::from("/var/run/user/1000/mysession-raw.log")
-    );
-    assert_eq!(
-        input_path,
-        PathBuf::from("/var/run/user/1000/mysession-input.log")
-    );
+        let socket_path = get_socket_path("test-session");
+        let log_path = get_log_path("test-session");
+        let debug_path = get_debug_raw_log_path("test-session");
+        let input_path = get_input_log_path("test-session");
 
-    // Clean up
-    unsafe {
-        std::env::remove_var("TERM_REPLAY_DIR");
-    }
-}
-
-#[test]
-fn test_default_session_name() {
-    // Test default session name behavior
-    unsafe {
-        std::env::remove_var("TERM_REPLAY_DIR");
+        assert_eq!(socket_path, PathBuf::from("/tmp/test-session.sock"));
+        assert_eq!(log_path, PathBuf::from("/tmp/test-session.log"));
+        assert_eq!(debug_path, PathBuf::from("/tmp/test-session-raw.log"));
+        assert_eq!(input_path, PathBuf::from("/tmp/test-session-input.log"));
     }
 
-    let socket_path = get_socket_path("term-replay");
-    let log_path = get_log_path("term-replay");
+    #[test]
+    fn test_path_generation_with_custom_dir() {
+        // Test with custom directory via environment variable
+        unsafe {
+            std::env::set_var("TERM_REPLAY_DIR", "/var/run/user/1000");
+        }
 
-    assert_eq!(socket_path, PathBuf::from("/tmp/term-replay.sock"));
-    assert_eq!(log_path, PathBuf::from("/tmp/term-replay.log"));
-}
+        let socket_path = get_socket_path("mysession");
+        let log_path = get_log_path("mysession");
+        let debug_path = get_debug_raw_log_path("mysession");
+        let input_path = get_input_log_path("mysession");
 
-#[test]
-fn test_session_name_with_special_characters() {
-    // Test session names with various characters
-    unsafe {
-        std::env::remove_var("TERM_REPLAY_DIR");
-    }
-
-    let socket_path = get_socket_path("my-work_session.123");
-    assert_eq!(socket_path, PathBuf::from("/tmp/my-work_session.123.sock"));
-
-    let socket_path = get_socket_path("dev");
-    assert_eq!(socket_path, PathBuf::from("/tmp/dev.sock"));
-}
-
-#[test]
-fn test_create_pty_with_custom_command() {
-    // Test creating PTY with a simple command that should exist on most systems
-    let command = vec!["echo".to_string(), "hello".to_string()];
-    let result = create_new_pty_with_command(&command);
-
-    assert!(
-        result.is_ok(),
-        "Should be able to create PTY with echo command"
-    );
-
-    if let Ok((pty_master, child_pid)) = result {
-        // Verify we got valid file descriptor and PID
-        assert!(
-            pty_master.as_raw_fd() > 0,
-            "PTY master should have valid fd"
+        assert_eq!(
+            socket_path,
+            PathBuf::from("/var/run/user/1000/mysession.sock")
         );
-        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
-
-        // Clean up the child process
-        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
-    }
-}
-
-#[test]
-fn test_create_pty_with_invalid_command() {
-    // Test creating PTY with a command that doesn't exist
-    // With bash -c, the PTY will be created but the command will fail inside
-    // This is actually the correct behavior - the error will be visible to the client
-    let command = vec!["nonexistent_command_12345".to_string()];
-    let result = create_new_pty_with_command(&command);
-
-    // PTY creation should succeed, but the command will fail and client will see the error
-    assert!(
-        result.is_ok(),
-        "PTY creation should succeed, command error will be visible to client"
-    );
-
-    if let Ok((pty_master, child_pid)) = result {
-        // Verify we got valid file descriptor and PID
-        assert!(
-            pty_master.as_raw_fd() > 0,
-            "PTY master should have valid fd"
+        assert_eq!(log_path, PathBuf::from("/var/run/user/1000/mysession.log"));
+        assert_eq!(
+            debug_path,
+            PathBuf::from("/var/run/user/1000/mysession-raw.log")
         );
-        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
-
-        // Clean up the child process
-        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
-    }
-}
-
-#[test]
-fn test_create_pty_with_empty_command() {
-    // Test creating PTY with empty command
-    let command = vec![];
-    let result = create_new_pty_with_command(&command);
-
-    assert!(result.is_err(), "Should fail with empty command");
-    assert!(result.unwrap_err().to_string().contains("cannot be empty"));
-}
-
-#[test]
-fn test_create_pty_with_command_arguments() {
-    // Test creating PTY with command and arguments (bash -c "ls -la")
-    let command = vec!["ls".to_string(), "-la".to_string()];
-    let result = create_new_pty_with_command(&command);
-
-    assert!(
-        result.is_ok(),
-        "Should be able to create PTY with ls command"
-    );
-
-    if let Ok((pty_master, child_pid)) = result {
-        // Verify we got valid file descriptor and PID
-        assert!(
-            pty_master.as_raw_fd() > 0,
-            "PTY master should have valid fd"
+        assert_eq!(
+            input_path,
+            PathBuf::from("/var/run/user/1000/mysession-input.log")
         );
-        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
 
-        // Clean up the child process
-        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        // Clean up
+        unsafe {
+            std::env::remove_var("TERM_REPLAY_DIR");
+        }
     }
-}
 
-#[test]
-fn test_create_pty_with_complex_command() {
-    // Test creating PTY with complex command that includes quotes and pipes
-    let command = vec![
-        "echo".to_string(),
-        "Hello World".to_string(),
-        "|".to_string(),
-        "cat".to_string(),
-    ];
-    let result = create_new_pty_with_command(&command);
+    #[test]
+    fn test_default_session_name() {
+        // Test default session name behavior
+        unsafe {
+            std::env::remove_var("TERM_REPLAY_DIR");
+        }
 
-    assert!(
-        result.is_ok(),
-        "Should be able to create PTY with complex command"
-    );
+        let socket_path = get_socket_path("term-replay");
+        let log_path = get_log_path("term-replay");
 
-    if let Ok((pty_master, child_pid)) = result {
-        // Verify we got valid file descriptor and PID
-        assert!(
-            pty_master.as_raw_fd() > 0,
-            "PTY master should have valid fd"
-        );
-        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
-
-        // Clean up the child process
-        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        assert_eq!(socket_path, PathBuf::from("/tmp/term-replay.sock"));
+        assert_eq!(log_path, PathBuf::from("/tmp/term-replay.log"));
     }
-}
 
-// Helper function for tests that need bash PTY
-fn create_new_pty_with_bash() -> Result<(std::os::unix::io::OwnedFd, nix::unistd::Pid)> {
-    create_new_pty_with_command(&["bash".to_string()])
-}
+    #[test]
+    fn test_session_name_with_special_characters() {
+        // Test session names with various characters
+        unsafe {
+            std::env::remove_var("TERM_REPLAY_DIR");
+        }
 
-#[test]
-fn test_backward_compatibility_bash_wrapper() {
-    // Test that the bash wrapper still works for tests
-    let result = create_new_pty_with_bash();
-    assert!(result.is_ok(), "Bash wrapper should still work for tests");
+        let socket_path = get_socket_path("my-work_session.123");
+        assert_eq!(socket_path, PathBuf::from("/tmp/my-work_session.123.sock"));
 
-    if let Ok((pty_master, child_pid)) = result {
-        // Verify we got valid file descriptor and PID
+        let socket_path = get_socket_path("dev");
+        assert_eq!(socket_path, PathBuf::from("/tmp/dev.sock"));
+    }
+
+    #[test]
+    fn test_create_pty_with_custom_command() {
+        // Test creating PTY with a simple command that should exist on most systems
+        let command = vec!["echo".to_string(), "hello".to_string()];
+        let result = create_new_pty_with_command(&command);
+
         assert!(
-            pty_master.as_raw_fd() > 0,
-            "PTY master should have valid fd"
+            result.is_ok(),
+            "Should be able to create PTY with echo command"
         );
-        assert!(child_pid.as_raw() > 0, "Child PID should be positive");
 
-        // Clean up the child process
-        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        if let Ok((pty_master, child_pid)) = result {
+            // Verify we got valid file descriptor and PID
+            assert!(
+                pty_master.as_raw_fd() > 0,
+                "PTY master should have valid fd"
+            );
+            assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+            // Clean up the child process
+            let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+            let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        }
+    }
+
+    #[test]
+    fn test_create_pty_with_invalid_command() {
+        // Test creating PTY with a command that doesn't exist
+        // With bash -c, the PTY will be created but the command will fail inside
+        // This is actually the correct behavior - the error will be visible to the client
+        let command = vec!["nonexistent_command_12345".to_string()];
+        let result = create_new_pty_with_command(&command);
+
+        // PTY creation should succeed, but the command will fail and client will see the error
+        assert!(
+            result.is_ok(),
+            "PTY creation should succeed, command error will be visible to client"
+        );
+
+        if let Ok((pty_master, child_pid)) = result {
+            // Verify we got valid file descriptor and PID
+            assert!(
+                pty_master.as_raw_fd() > 0,
+                "PTY master should have valid fd"
+            );
+            assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+            // Clean up the child process
+            let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+            let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        }
+    }
+
+    #[test]
+    fn test_create_pty_with_empty_command() {
+        // Test creating PTY with empty command
+        let command = vec![];
+        let result = create_new_pty_with_command(&command);
+
+        assert!(result.is_err(), "Should fail with empty command");
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_create_pty_with_command_arguments() {
+        // Test creating PTY with command and arguments (bash -c "ls -la")
+        let command = vec!["ls".to_string(), "-la".to_string()];
+        let result = create_new_pty_with_command(&command);
+
+        assert!(
+            result.is_ok(),
+            "Should be able to create PTY with ls command"
+        );
+
+        if let Ok((pty_master, child_pid)) = result {
+            // Verify we got valid file descriptor and PID
+            assert!(
+                pty_master.as_raw_fd() > 0,
+                "PTY master should have valid fd"
+            );
+            assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+            // Clean up the child process
+            let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+            let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        }
+    }
+
+    #[test]
+    fn test_create_pty_with_complex_command() {
+        // Test creating PTY with complex command that includes quotes and pipes
+        let command = vec![
+            "echo".to_string(),
+            "Hello World".to_string(),
+            "|".to_string(),
+            "cat".to_string(),
+        ];
+        let result = create_new_pty_with_command(&command);
+
+        assert!(
+            result.is_ok(),
+            "Should be able to create PTY with complex command"
+        );
+
+        if let Ok((pty_master, child_pid)) = result {
+            // Verify we got valid file descriptor and PID
+            assert!(
+                pty_master.as_raw_fd() > 0,
+                "PTY master should have valid fd"
+            );
+            assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+            // Clean up the child process
+            let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+            let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        }
+    }
+
+    #[test]
+    fn test_backward_compatibility_bash_wrapper() {
+        // Test that the bash wrapper still works for tests
+        let result = create_new_pty_with_bash();
+        assert!(result.is_ok(), "Bash wrapper should still work for tests");
+
+        if let Ok((pty_master, child_pid)) = result {
+            // Verify we got valid file descriptor and PID
+            assert!(
+                pty_master.as_raw_fd() > 0,
+                "PTY master should have valid fd"
+            );
+            assert!(child_pid.as_raw() > 0, "Child PID should be positive");
+
+            // Clean up the child process
+            let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+            let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        }
     }
 }

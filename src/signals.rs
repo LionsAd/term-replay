@@ -1,5 +1,6 @@
 use nix::sys::signal::{self, SigHandler, Signal};
-use nix::unistd::{self, Pid};
+#[cfg(test)]
+use nix::unistd::Pid;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -23,39 +24,24 @@ extern "C" fn handle_shutdown(sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-/// Terminal death handler (for clients)
-extern "C" fn handle_death(sig: libc::c_int) {
-    const EOS: &str = "\x1b[999H";
-
-    match sig {
-        libc::SIGHUP | libc::SIGINT => {
-            println!("{}\\r\\n[detached]\\r\\n", EOS);
-        }
-        _ => {
-            println!("{}\\r\\n[got signal {} - dying]\\r\\n", EOS, sig);
-        }
-    }
-    std::process::exit(1);
-}
-
 /// Signal manager for coordinating signal handling
 pub struct SignalManager {
     /// PTY process ID for signal forwarding
+    #[cfg(test)]
     pty_pid: Option<Pid>,
     /// Client mode vs server mode
+    #[cfg(test)]
     is_client: bool,
 }
 
 impl SignalManager {
-    pub fn new(is_client: bool) -> Self {
+    pub fn new(_is_client: bool) -> Self {
         Self {
+            #[cfg(test)]
             pty_pid: None,
-            is_client,
+            #[cfg(test)]
+            is_client: _is_client,
         }
-    }
-
-    pub fn set_pty_pid(&mut self, pid: Pid) {
-        self.pty_pid = Some(pid);
     }
 
     /// Initialize signal handlers for server mode
@@ -92,54 +78,8 @@ impl SignalManager {
         Ok(())
     }
 
-    /// Initialize signal handlers for client mode
-    pub fn setup_client_signals(&self) -> io::Result<()> {
-        unsafe {
-            // Set up SIGWINCH handler
-            signal::signal(Signal::SIGWINCH, SigHandler::Handler(handle_winch))
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-
-            // Ignore SIGPIPE
-            signal::signal(Signal::SIGPIPE, SigHandler::SigIgn)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-            signal::signal(Signal::SIGXFSZ, SigHandler::SigIgn)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-
-            // Set up death handlers for clean disconnect
-            let death_handler = SigHandler::Handler(handle_death);
-            signal::signal(Signal::SIGHUP, death_handler)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-            signal::signal(Signal::SIGTERM, death_handler)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-            signal::signal(Signal::SIGINT, death_handler)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-            signal::signal(Signal::SIGQUIT, death_handler)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-        }
-
-        Ok(())
-    }
-
-    /// Forward signal to PTY process group
-    pub fn forward_signal_to_pty(&self, sig: Signal) -> io::Result<()> {
-        if let Some(pid) = self.pty_pid {
-            // Try to get the process group first
-            match unistd::getpgid(Some(pid)) {
-                Ok(pgrp) => {
-                    // Send signal to process group
-                    signal::killpg(pgrp, sig)
-                        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-                }
-                Err(_) => {
-                    // Fallback: send to process directly
-                    signal::kill(pid, sig).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Check and reset window size change flag
+    #[cfg(test)]
     pub fn check_window_changed(&self) -> bool {
         WINDOW_CHANGED.swap(false, Ordering::Relaxed)
     }
@@ -160,27 +100,11 @@ impl SignalManager {
     }
 
     /// Reset shutdown state (for testing)
+    #[cfg(test)]
     pub fn reset_shutdown(&self) {
         SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
         SHUTDOWN_SIGNAL.store(0, Ordering::Relaxed);
     }
-}
-
-/// Send SIGWINCH to process/group
-pub fn send_winch_to_process(pid: Pid) -> io::Result<()> {
-    // Try process group first
-    match unistd::getpgid(Some(pid)) {
-        Ok(pgrp) => {
-            signal::killpg(pgrp, Signal::SIGWINCH)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-        }
-        Err(_) => {
-            // Fallback to direct process
-            signal::kill(pid, Signal::SIGWINCH)
-                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -64,13 +64,6 @@ impl WindowSizeManager {
         }
     }
 
-    /// Initialize with current terminal size
-    pub fn init_from_terminal(&mut self, fd: RawFd) -> io::Result<()> {
-        let ws = get_window_size(fd)?;
-        self.current_size = WindowSize::from_winsize(&ws);
-        Ok(())
-    }
-
     /// Update window size and broadcast changes
     pub fn update_size(&mut self, new_size: WindowSize) -> bool {
         if new_size != self.current_size && new_size.is_valid() {
@@ -84,13 +77,9 @@ impl WindowSizeManager {
     }
 
     /// Get current window size
+    #[cfg(test)]
     pub fn current_size(&self) -> WindowSize {
         self.current_size
-    }
-
-    /// Subscribe to window size changes
-    pub fn subscribe(&self) -> broadcast::Receiver<WindowSize> {
-        self.size_sender.subscribe()
     }
 
     /// Apply window size to a file descriptor (PTY master)
