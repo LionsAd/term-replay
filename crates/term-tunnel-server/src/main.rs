@@ -141,3 +141,101 @@ async fn wait_for_shutdown() {
         _ = terminate => {},
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_health_check_endpoint() {
+        let app = create_app_router().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["service"], "term-tunnel-server");
+        assert!(json["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_endpoint() {
+        let app = create_app_router().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/list-sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let sessions: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "term-replay");
+        assert_eq!(sessions[0].name, "Default Session");
+        assert_eq!(sessions[1].id, "test-session");
+        assert_eq!(sessions[1].name, "Test Session");
+    }
+
+    #[tokio::test]
+    async fn test_placeholder_session_creation() {
+        let sessions = create_placeholder_sessions();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "term-replay");
+        assert_eq!(sessions[1].id, "test-session");
+
+        // Verify sessions have different PIDs
+        assert_ne!(sessions[0].pid, sessions[1].pid);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_emission() {
+        // Test that handshake function doesn't panic
+        let result = emit_handshake();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_endpoint() {
+        let app = create_app_router().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

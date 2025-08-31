@@ -429,3 +429,123 @@ impl tokio::io::AsyncWrite for PtyStream {
         std::task::Poll::Ready(Ok(()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handshake_sequence_constant() {
+        // Verify the handshake sequence is correct
+        assert_eq!(TUNNEL_READY_SEQUENCE, b"\x1b]tunnel-ready;\x07");
+        assert_eq!(TUNNEL_READY_SEQUENCE.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_detection_in_single_buffer() {
+        // Simulate handshake sequence in a single read
+        let handshake_data = b"Starting server...\x1b]tunnel-ready;\x07Server ready";
+        let mut handshake_buffer = Vec::new();
+        handshake_buffer.extend_from_slice(handshake_data);
+
+        let pos = handshake_buffer
+            .windows(TUNNEL_READY_SEQUENCE.len())
+            .position(|window| window == TUNNEL_READY_SEQUENCE);
+
+        assert_eq!(pos, Some(18)); // Position after "Starting server..."
+    }
+
+    #[tokio::test]
+    async fn test_handshake_detection_split_across_buffers() {
+        // Simulate handshake sequence split across multiple reads
+        let mut handshake_buffer = Vec::new();
+
+        // First chunk - partial handshake
+        handshake_buffer.extend_from_slice(b"Starting server...\x1b]tunnel-");
+
+        // Check no false positive
+        let pos = handshake_buffer
+            .windows(TUNNEL_READY_SEQUENCE.len())
+            .position(|window| window == TUNNEL_READY_SEQUENCE);
+        assert_eq!(pos, None);
+
+        // Second chunk - complete handshake
+        handshake_buffer.extend_from_slice(b"ready;\x07Server ready");
+
+        let pos = handshake_buffer
+            .windows(TUNNEL_READY_SEQUENCE.len())
+            .position(|window| window == TUNNEL_READY_SEQUENCE);
+        assert_eq!(pos, Some(18));
+    }
+
+    #[tokio::test]
+    async fn test_handshake_detection_no_false_positives() {
+        // Test similar but incorrect sequences
+        let test_cases: Vec<&[u8]> = vec![
+            b"\\x1b]tunnel-ready;\\x07", // Escaped sequences
+            b"\x1b]tunnel-ready;\x06",   // Wrong ending byte
+            b"\x1a]tunnel-ready;\x07",   // Wrong starting byte
+            b"\x1b[tunnel-ready;\x07",   // Wrong bracket
+            b"\x1b]tunnel-ready\x07",    // Missing semicolon
+            b"tunnel-ready",             // Partial sequence
+        ];
+
+        for test_data in test_cases {
+            let mut handshake_buffer = Vec::new();
+            handshake_buffer.extend_from_slice(test_data);
+
+            let pos = handshake_buffer
+                .windows(TUNNEL_READY_SEQUENCE.len())
+                .position(|window| window == TUNNEL_READY_SEQUENCE);
+
+            assert_eq!(pos, None, "False positive for: {:?}", test_data);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handshake_detection_multiple_occurrences() {
+        // Test finding first occurrence when multiple exist
+        let data = b"prefix\x1b]tunnel-ready;\x07middle\x1b]tunnel-ready;\x07suffix";
+        let mut handshake_buffer = Vec::new();
+        handshake_buffer.extend_from_slice(data);
+
+        let pos = handshake_buffer
+            .windows(TUNNEL_READY_SEQUENCE.len())
+            .position(|window| window == TUNNEL_READY_SEQUENCE);
+
+        assert_eq!(pos, Some(6)); // First occurrence position
+    }
+
+    #[tokio::test]
+    async fn test_handshake_buffer_overflow_protection() {
+        // Test the buffer overflow protection logic
+        let large_data = b"A".repeat(100);
+        let mut handshake_buffer = Vec::new();
+        handshake_buffer.extend_from_slice(&large_data);
+
+        // Simulate the overflow protection from run_terminal_mode
+        let max_size = TUNNEL_READY_SEQUENCE.len() * 2;
+        if handshake_buffer.len() > max_size {
+            let split_point = handshake_buffer.len() - TUNNEL_READY_SEQUENCE.len() + 1;
+            handshake_buffer.drain(..split_point);
+        }
+
+        // Buffer should be reduced to manageable size
+        assert!(handshake_buffer.len() <= TUNNEL_READY_SEQUENCE.len());
+    }
+
+    #[tokio::test]
+    async fn test_handshake_edge_case_exact_boundary() {
+        // Test handshake at exact buffer boundaries
+        let mut handshake_buffer = Vec::new();
+
+        // Add exactly the sequence
+        handshake_buffer.extend_from_slice(TUNNEL_READY_SEQUENCE);
+
+        let pos = handshake_buffer
+            .windows(TUNNEL_READY_SEQUENCE.len())
+            .position(|window| window == TUNNEL_READY_SEQUENCE);
+
+        assert_eq!(pos, Some(0)); // Found at beginning
+    }
+}
