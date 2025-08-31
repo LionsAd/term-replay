@@ -21,6 +21,13 @@ use signals::SignalManager;
 use terminal::TerminalState;
 use winsize::{WindowSizeManager, get_terminal_size};
 
+/// Data sent from the PTY task to client handlers.
+#[derive(Debug, Clone)]
+enum PtyOutput {
+    Data(Vec<u8>),
+    Shutdown,
+}
+
 /// Parse detach character from string (e.g., "^\" -> Ctrl-\, "^?" -> DEL)
 fn parse_detach_char(detach_str: &str) -> Result<u8> {
     if detach_str.starts_with('^') && detach_str.len() == 2 {
@@ -308,7 +315,7 @@ fn create_new_pty_with_command(
 /// PTY reader task that handles PTY output and manages PTY lifecycle
 async fn pty_reader_task(
     pty_async_fd: Arc<AsyncFd<std::os::unix::io::OwnedFd>>,
-    tx: broadcast::Sender<Vec<u8>>,
+    tx: broadcast::Sender<PtyOutput>,
     debug_raw_log: Option<Arc<Mutex<TokioFile>>>,
     log_file: Arc<Mutex<TokioFile>>,
     pty_async_shared: Arc<Mutex<Option<Arc<AsyncFd<std::os::unix::io::OwnedFd>>>>>,
@@ -372,8 +379,13 @@ async fn pty_reader_task(
                     }
                 }
 
-                // Broadcast exit message and then close the channel to disconnect all clients
-                let _ = tx.send(exit_message.as_bytes().to_vec());
+                // Broadcast exit message to all clients
+                let _ = tx.send(PtyOutput::Data(exit_message.as_bytes().to_vec()));
+
+                // Send shutdown signal to all clients
+                if let Err(e) = tx.send(PtyOutput::Shutdown) {
+                    tracing::error!("Failed to send shutdown signal: {}", e);
+                }
 
                 tracing::info!("🏁 PTY reader task exiting - server ready for new connections");
                 break;
@@ -398,7 +410,7 @@ async fn pty_reader_task(
                 }
 
                 // Always broadcast to all clients (they see everything live)
-                if tx.send(data.clone()).is_err() {
+                if tx.send(PtyOutput::Data(data.clone())).is_err() {
                     // This means no clients are connected, which is fine.
                 }
 
@@ -744,7 +756,7 @@ async fn server_main(session_name: &str, command: &[String]) -> Result<()> {
     };
 
     // Broadcast channel to send PTY output to all connected clients
-    let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
+    let (tx, _) = broadcast::channel::<PtyOutput>(1024);
 
     // Track PTY state - None when no PTY exists, Some when PTY is active
     let pty_async: Arc<Mutex<Option<Arc<AsyncFd<std::os::unix::io::OwnedFd>>>>> =
@@ -922,7 +934,7 @@ async fn handle_client(
     stream: UnixStream,
     pty_async: Option<Arc<AsyncFd<std::os::unix::io::OwnedFd>>>,
     input_log: Option<Arc<Mutex<TokioFile>>>,
-    rx: &mut broadcast::Receiver<Vec<u8>>,
+    rx: &mut broadcast::Receiver<PtyOutput>,
     log_path: &Path,
 ) -> Result<()> {
     let pty_info = if let Some(ref pty) = pty_async {
@@ -1043,10 +1055,15 @@ async fn handle_client(
             // c. Read from broadcast channel (PTY output) and write to client
             result = rx.recv() => {
                 match result {
-                    Ok(data) => {
+                    Ok(PtyOutput::Data(data)) => {
                         tracing::debug!("📺 Received {} bytes from broadcast: {:?}", data.len(), String::from_utf8_lossy(&data));
                         client_writer.write_all(&data).await?;
                         tracing::debug!("📤 Forwarded {} bytes to client", data.len());
+                    }
+                    Ok(PtyOutput::Shutdown) => {
+                        tracing::info!("🛑 Received shutdown signal. Closing client connection.");
+                        let _ = client_writer.write_all(b"\r\n[Session terminated by server]\r\n").await;
+                        break;
                     }
                     Err(e) => {
                         tracing::error!("❌ Broadcast channel error: {}", e);
@@ -1298,7 +1315,7 @@ mod tests {
     #[tokio::test]
     async fn test_pty_lifecycle() {
         // Test that PTY state management works correctly
-        let (_tx, _) = broadcast::channel::<Vec<u8>>(1024);
+        let (_tx, _) = broadcast::channel::<PtyOutput>(1024);
         let pty_async: Arc<Mutex<Option<Arc<AsyncFd<RawFd>>>>> = Arc::new(Mutex::new(None));
 
         // Initially no PTY should exist
