@@ -3,6 +3,8 @@ members = [
     "crates/term-core",
     "crates/term-session", 
     "crates/term-protocol",
+    "crates/term-server",
+    "crates/term-client",
     "crates/term-replay",
     "crates/term-tunnel",
     "crates/term-tunnel-server"

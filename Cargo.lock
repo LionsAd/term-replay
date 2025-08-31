@@ -611,6 +611,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "term-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nix",
+ "term-core",
+ "term-session",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "term-core"
 version = "0.1.0"
 dependencies = [
@@ -637,8 +650,20 @@ name = "term-replay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
+ "term-client",
+ "term-protocol",
+ "term-server",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "term-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "libc",
  "nix",
  "term-core",
@@ -647,7 +672,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
