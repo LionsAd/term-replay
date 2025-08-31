@@ -17,6 +17,8 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
+futures-util = "0.3"
 
 # Local crates
 term-protocol = { path = "../term-protocol" }
+term-session = { path = "../term-session" }
