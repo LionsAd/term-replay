@@ -720,6 +720,64 @@ async fn server_main(session_name: &str, command: &[String]) -> Result<()> {
 
     // 1. No PTY creation at startup - will be created on first client connection
 
+    // Spawn a dedicated task to reap zombie child processes
+    tokio::spawn(async move {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // The OS sends SIGCHLD when a child process (like our PTY) exits
+        let mut sigchld_stream =
+            signal(SignalKind::child()).expect("Failed to create SIGCHLD listener");
+
+        tracing::debug!("🧟 Zombie reaper task started - listening for SIGCHLD");
+
+        // Loop forever, waiting for the signal
+        while sigchld_stream.recv().await.is_some() {
+            tracing::debug!("📢 Received SIGCHLD - reaping zombie children");
+
+            // Loop to reap ALL zombie children that might exist
+            // Using WNOHANG means waitpid will return immediately
+            // if there are no more zombies to reap
+            loop {
+                match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::Exited(pid, status)) => {
+                        tracing::info!(
+                            "🧟 Reaped zombie child process {} with exit status {}",
+                            pid,
+                            status
+                        );
+                    }
+                    Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                        tracing::info!(
+                            "🧟 Reaped zombie child process {} killed by signal {}",
+                            pid,
+                            sig
+                        );
+                    }
+                    Ok(WaitStatus::StillAlive) => {
+                        // No more zombies to reap right now
+                        tracing::debug!("✅ No more zombie children to reap");
+                        break;
+                    }
+                    Err(nix::errno::Errno::ECHILD) => {
+                        // No children left to wait for
+                        tracing::debug!("ℹ️  No child processes exist");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!("❌ Error in waitpid: {}", e);
+                        break;
+                    }
+                    _ => {
+                        // Other wait statuses we don't need to handle for zombies
+                        tracing::debug!("🔄 Other wait status encountered, continuing");
+                    }
+                }
+            }
+        }
+        tracing::debug!("🧟 Zombie reaper task exiting");
+    });
+
     let listener = UnixListener::bind(&socket_path)?;
     let log_file = Arc::new(Mutex::new(
         OpenOptions::new()
