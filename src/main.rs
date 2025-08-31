@@ -1,6 +1,7 @@
 // src/main.rs
 
 mod signals;
+mod stdin;
 mod terminal;
 mod winsize;
 
@@ -18,6 +19,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
 
 use signals::SignalManager;
+use stdin::StdinReader;
 use terminal::TerminalState;
 use winsize::{WindowSizeManager, get_terminal_size};
 
@@ -1167,7 +1169,9 @@ async fn client_main(detach_char: u8, session_name: &str) -> Result<()> {
     print!("\x1b[H\x1b[J");
     std::io::Write::flush(&mut std::io::stdout())?;
 
-    let mut stdin = tokio::io::stdin();
+    // Start stdin reader in dedicated thread
+    let mut stdin_reader = StdinReader::start()?;
+
     let mut stdout = tokio::io::stdout();
 
     // Create tokio signal handlers
@@ -1178,7 +1182,6 @@ async fn client_main(detach_char: u8, session_name: &str) -> Result<()> {
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     // Enhanced client loop with signal handling
-    let mut stdin_buf = [0u8; 1024];
     let mut server_buf = [0u8; 1024];
 
     loop {
@@ -1215,47 +1218,32 @@ async fn client_main(detach_char: u8, session_name: &str) -> Result<()> {
                 tracing::info!("Received SIGHUP");
                 break;
             }
-            // Handle keyboard input
-            result = stdin.read(&mut stdin_buf) => {
-                match result {
-                    Ok(0) => {
-                        tracing::info!("Local stdin closed");
-                        break;
-                    }
-                    Ok(n) => {
-                        // Process input for detach key
-                        let input_data = &stdin_buf[..n];
-
-                        // Check for detach character in input
-                        if let Some(detach_pos) = input_data.iter().position(|&b| b == detach_char) {
-                            // Send any data before the detach key
-                            if detach_pos > 0 {
-                                if let Err(e) = server_writer.write_all(&input_data[..detach_pos]).await {
-                                    tracing::error!("Failed to write to server: {}", e);
-                                }
-                                let _ = server_writer.flush().await;
-                            }
-
-                            // Handle detach: show message and exit gracefully
-                            print!("\x1b[999H\r\n[detached]\r\n");
-                            std::io::Write::flush(&mut std::io::stdout())?;
-                            break;
-                        }
-
-                        // No detach key found, send all data to server
-                        if let Err(e) = server_writer.write_all(input_data).await {
+            // Handle keyboard input from stdin reader
+            Some(input_data) = stdin_reader.receiver().recv() => {
+                // Check for detach character in input
+                if let Some(detach_pos) = input_data.iter().position(|&b| b == detach_char) {
+                    // Send any data before the detach key
+                    if detach_pos > 0 {
+                        if let Err(e) = server_writer.write_all(&input_data[..detach_pos]).await {
                             tracing::error!("Failed to write to server: {}", e);
-                            break;
                         }
-                        if let Err(e) = server_writer.flush().await {
-                            tracing::error!("Failed to flush server writer: {}", e);
-                            break;
-                        }
+                        let _ = server_writer.flush().await;
                     }
-                    Err(e) => {
-                        tracing::error!("Error reading from stdin: {}", e);
-                        break;
-                    }
+
+                    // Handle detach: show message and exit gracefully
+                    print!("\x1b[999H\r\n[detached]\r\n");
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                    break;
+                }
+
+                // No detach key found, send all data to server
+                if let Err(e) = server_writer.write_all(&input_data).await {
+                    tracing::error!("Failed to write to server: {}", e);
+                    break;
+                }
+                if let Err(e) = server_writer.flush().await {
+                    tracing::error!("Failed to flush server writer: {}", e);
+                    break;
                 }
             }
 
@@ -1283,6 +1271,11 @@ async fn client_main(detach_char: u8, session_name: &str) -> Result<()> {
                 }
             }
         }
+    }
+
+    // Shutdown stdin reader gracefully
+    if let Err(e) = stdin_reader.shutdown().await {
+        tracing::warn!("Failed to shutdown stdin reader: {}", e);
     }
 
     // Terminal state will be automatically restored by Drop trait
@@ -1325,12 +1318,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Tokio runtime sometimes hangs during shutdown despite proper cleanup
-    // Force exit to avoid waiting indefinitely
-    std::process::exit(match result {
-        Ok(()) => 0,
-        Err(_) => 1,
-    });
+    result
 }
 
 #[cfg(test)]
