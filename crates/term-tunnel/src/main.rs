@@ -252,7 +252,7 @@ async fn run_tunnel_mode(
 
     // Create smux session from PTY
     let pty_stream = create_pty_stream(pty_async).await?;
-    let mut session = smux::Session::server(pty_stream, smux::Config::default()).await?;
+    let session = smux::Session::server(pty_stream, smux::Config::default()).await?;
     tracing::info!("🎯 Created smux server session");
 
     // Handle incoming connections using the smux session
