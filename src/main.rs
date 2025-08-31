@@ -10,7 +10,7 @@ use nix::pty::{ForkptyResult, forkpty};
 use nix::unistd;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{File as TokioFile, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, unix::AsyncFd};
@@ -438,14 +438,46 @@ async fn pty_reader_task(
     }
 }
 
-const SOCKET_PATH: &str = "/tmp/term-replay.sock";
-const LOG_PATH: &str = "/tmp/term-replay.log";
-const DEBUG_RAW_LOG_PATH: &str = "/tmp/term-replay-raw.log";
-const INPUT_LOG_PATH: &str = "/tmp/term-replay-input.log";
-
 // Debug flag - set to true to enable raw logging
 const DEBUG_RAW_LOGGING: bool = true;
 const INPUT_LOGGING: bool = true;
+
+/// Get the directory for terminal replay files, checking TERM_REPLAY_DIR env var
+fn get_term_replay_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TERM_REPLAY_DIR") {
+        PathBuf::from(dir)
+    } else {
+        PathBuf::from("/tmp")
+    }
+}
+
+/// Generate socket path for a given session name
+fn get_socket_path(socket_name: &str) -> PathBuf {
+    let mut path = get_term_replay_dir();
+    path.push(format!("{}.sock", socket_name));
+    path
+}
+
+/// Generate main log path for a given session name
+fn get_log_path(socket_name: &str) -> PathBuf {
+    let mut path = get_term_replay_dir();
+    path.push(format!("{}.log", socket_name));
+    path
+}
+
+/// Generate debug raw log path for a given session name
+fn get_debug_raw_log_path(socket_name: &str) -> PathBuf {
+    let mut path = get_term_replay_dir();
+    path.push(format!("{}-raw.log", socket_name));
+    path
+}
+
+/// Generate input log path for a given session name
+fn get_input_log_path(socket_name: &str) -> PathBuf {
+    let mut path = get_term_replay_dir();
+    path.push(format!("{}-input.log", socket_name));
+    path
+}
 
 // Terminal mode tracking
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -604,17 +636,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the persistent terminal server
-    Server,
+    Server {
+        /// Set the socket name (default: term-replay). Creates {name}.sock and {name}.log
+        #[arg(short = 'S', long = "socket-name", value_name = "NAME")]
+        socket_name: Option<String>,
+    },
     /// Attach to the persistent terminal server
     Client {
         /// Set the detach character (default: Ctrl-\). Use '^?' for DEL, '^X' for Ctrl-X
         #[arg(short = 'e', long = "escape", value_name = "CHAR")]
         detach_char: Option<String>,
+        /// Set the socket name (default: term-replay). Connects to {name}.sock
+        #[arg(short = 'S', long = "socket-name", value_name = "NAME")]
+        socket_name: Option<String>,
     },
 }
 
 // SERVER LOGIC
-async fn server_main() -> Result<()> {
+async fn server_main(session_name: &str) -> Result<()> {
     // Initialize signal manager for server mode
     let signal_manager = SignalManager::new(false);
     signal_manager.setup_server_signals()?;
@@ -622,28 +661,37 @@ async fn server_main() -> Result<()> {
     // Initialize window size manager with defaults for server
     let window_manager = WindowSizeManager::new();
 
-    // Clean up previous runs
-    if Path::new(SOCKET_PATH).exists() {
-        std::fs::remove_file(SOCKET_PATH)?;
+    // Generate paths for this session
+    let socket_path = get_socket_path(session_name);
+    let log_path = get_log_path(session_name);
+    let debug_raw_log_path = get_debug_raw_log_path(session_name);
+    let input_log_path = get_input_log_path(session_name);
+
+    // Check if session already exists
+    if socket_path.exists() {
+        anyhow::bail!(
+            "Session '{}' already exists (socket: {}). Please choose a different name or stop the existing session.",
+            session_name,
+            socket_path.display()
+        );
     }
-    if Path::new(LOG_PATH).exists() {
-        std::fs::remove_file(LOG_PATH)?;
+
+    // Clean up debug and input logs from previous runs (preserve main log)
+    if DEBUG_RAW_LOGGING && debug_raw_log_path.exists() {
+        std::fs::remove_file(&debug_raw_log_path)?;
     }
-    if DEBUG_RAW_LOGGING && Path::new(DEBUG_RAW_LOG_PATH).exists() {
-        std::fs::remove_file(DEBUG_RAW_LOG_PATH)?;
-    }
-    if INPUT_LOGGING && Path::new(INPUT_LOG_PATH).exists() {
-        std::fs::remove_file(INPUT_LOG_PATH)?;
+    if INPUT_LOGGING && input_log_path.exists() {
+        std::fs::remove_file(&input_log_path)?;
     }
 
     // 1. No PTY creation at startup - will be created on first client connection
 
-    let listener = UnixListener::bind(SOCKET_PATH)?;
+    let listener = UnixListener::bind(&socket_path)?;
     let log_file = Arc::new(Mutex::new(
         OpenOptions::new()
             .create(true)
             .append(true)
-            .open(LOG_PATH)
+            .open(&log_path)
             .await?,
     ));
 
@@ -653,7 +701,7 @@ async fn server_main() -> Result<()> {
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(DEBUG_RAW_LOG_PATH)
+                .open(&debug_raw_log_path)
                 .await?,
         )))
     } else {
@@ -666,7 +714,7 @@ async fn server_main() -> Result<()> {
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(INPUT_LOG_PATH)
+                .open(&input_log_path)
                 .await?,
         )))
     } else {
@@ -687,7 +735,7 @@ async fn server_main() -> Result<()> {
 
     // 4. Main Accept Loop with Signal Handling
     // This loop waits for new clients to connect and handles window size changes.
-    tracing::info!("Server listening on {}", SOCKET_PATH);
+    tracing::info!("Server listening on {}", socket_path.display());
     loop {
         // Server window size changes are handled per-client via escape sequences
 
@@ -696,6 +744,20 @@ async fn server_main() -> Result<()> {
             if let Some(sig) = signal_manager.get_shutdown_signal() {
                 tracing::info!("Received shutdown signal: {:?}, terminating server", sig);
             }
+
+            // Clean up socket file before shutdown
+            if socket_path.exists() {
+                if let Err(e) = std::fs::remove_file(&socket_path) {
+                    tracing::warn!(
+                        "Failed to remove socket file {}: {}",
+                        socket_path.display(),
+                        e
+                    );
+                } else {
+                    tracing::debug!("Cleaned up socket file: {}", socket_path.display());
+                }
+            }
+
             return Ok(());
         }
 
@@ -801,13 +863,14 @@ async fn server_main() -> Result<()> {
                         };
 
                         let input_log_clone = input_log.clone();
+                        let log_path_clone = log_path.clone();
                         let mut rx = tx.subscribe();
                         tracing::debug!("📺 Created broadcast receiver for client");
 
                         tracing::info!("🎬 Spawning client handler task...");
                         tokio::spawn(async move {
                             tracing::debug!("👤 Client handler task started");
-                            match handle_client(stream, pty_async_clone, input_log_clone, &mut rx).await {
+                            match handle_client(stream, pty_async_clone, input_log_clone, &mut rx, &log_path_clone).await {
                                 Err(e) => {
                                     tracing::warn!("❌ Client disconnected with error: {}", e);
                                 }
@@ -838,6 +901,7 @@ async fn handle_client(
     pty_async: Option<Arc<AsyncFd<std::os::unix::io::OwnedFd>>>,
     input_log: Option<Arc<Mutex<TokioFile>>>,
     rx: &mut broadcast::Receiver<Vec<u8>>,
+    log_path: &Path,
 ) -> Result<()> {
     let pty_info = if let Some(ref pty) = pty_async {
         format!("fd {}", pty.as_raw_fd())
@@ -852,8 +916,11 @@ async fn handle_client(
     let mut input_parser = InputParser::new();
 
     // a. Replay history
-    tracing::debug!("📜 Attempting to replay history from {}", LOG_PATH);
-    match TokioFile::open(LOG_PATH).await {
+    tracing::debug!(
+        "📜 Attempting to replay history from {}",
+        log_path.display()
+    );
+    match TokioFile::open(log_path).await {
         Ok(mut history_file) => {
             let bytes_copied = tokio::io::copy(&mut history_file, &mut client_writer).await?;
             tracing::info!("📜 Replayed {} bytes of history to client", bytes_copied);
@@ -971,7 +1038,7 @@ async fn handle_client(
 }
 
 // CLIENT LOGIC
-async fn client_main(detach_char: u8) -> Result<()> {
+async fn client_main(detach_char: u8, session_name: &str) -> Result<()> {
     // Initialize terminal state
     let mut terminal_state = TerminalState::new()?;
     if !terminal_state.is_terminal_available() {
@@ -983,14 +1050,17 @@ async fn client_main(detach_char: u8) -> Result<()> {
     let mut window_manager = WindowSizeManager::new();
     window_manager.update_size(initial_window_size);
 
-    if !Path::new(SOCKET_PATH).exists() {
+    let socket_path = get_socket_path(session_name);
+
+    if !socket_path.exists() {
         anyhow::bail!(
-            "Server socket not found at {}. Is the server running?",
-            SOCKET_PATH
+            "Server socket not found at {}. Is the server running? (session: '{}')",
+            socket_path.display(),
+            session_name
         );
     }
 
-    let stream = UnixStream::connect(SOCKET_PATH).await?;
+    let stream = UnixStream::connect(&socket_path).await?;
     let (mut server_reader, mut server_writer) = tokio::io::split(stream);
 
     // Enter raw terminal mode for proper terminal control
@@ -1132,14 +1202,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server => server_main().await,
-        Commands::Client { detach_char } => {
+        Commands::Server { socket_name } => {
+            let session_name = socket_name.unwrap_or_else(|| "term-replay".to_string());
+            server_main(&session_name).await
+        }
+        Commands::Client {
+            detach_char,
+            socket_name,
+        } => {
             let detach_byte = if let Some(char_str) = detach_char {
                 parse_detach_char(&char_str)?
             } else {
                 0x1C // Default: Ctrl-\
             };
-            client_main(detach_byte).await
+            let session_name = socket_name.unwrap_or_else(|| "term-replay".to_string());
+            client_main(detach_byte, &session_name).await
         }
     }
 }
@@ -1498,4 +1575,82 @@ fn test_multiple_sequences_in_chunk() {
 
     // Should detect the destructive clear
     assert!(actions.contains(&SequenceAction::DestructiveClear));
+}
+
+#[test]
+fn test_path_generation_with_default_dir() {
+    // Test with default directory (/tmp)
+    unsafe {
+        std::env::remove_var("TERM_REPLAY_DIR");
+    }
+
+    let socket_path = get_socket_path("test-session");
+    let log_path = get_log_path("test-session");
+    let debug_path = get_debug_raw_log_path("test-session");
+    let input_path = get_input_log_path("test-session");
+
+    assert_eq!(socket_path, PathBuf::from("/tmp/test-session.sock"));
+    assert_eq!(log_path, PathBuf::from("/tmp/test-session.log"));
+    assert_eq!(debug_path, PathBuf::from("/tmp/test-session-raw.log"));
+    assert_eq!(input_path, PathBuf::from("/tmp/test-session-input.log"));
+}
+
+#[test]
+fn test_path_generation_with_custom_dir() {
+    // Test with custom directory via environment variable
+    unsafe {
+        std::env::set_var("TERM_REPLAY_DIR", "/var/run/user/1000");
+    }
+
+    let socket_path = get_socket_path("mysession");
+    let log_path = get_log_path("mysession");
+    let debug_path = get_debug_raw_log_path("mysession");
+    let input_path = get_input_log_path("mysession");
+
+    assert_eq!(
+        socket_path,
+        PathBuf::from("/var/run/user/1000/mysession.sock")
+    );
+    assert_eq!(log_path, PathBuf::from("/var/run/user/1000/mysession.log"));
+    assert_eq!(
+        debug_path,
+        PathBuf::from("/var/run/user/1000/mysession-raw.log")
+    );
+    assert_eq!(
+        input_path,
+        PathBuf::from("/var/run/user/1000/mysession-input.log")
+    );
+
+    // Clean up
+    unsafe {
+        std::env::remove_var("TERM_REPLAY_DIR");
+    }
+}
+
+#[test]
+fn test_default_session_name() {
+    // Test default session name behavior
+    unsafe {
+        std::env::remove_var("TERM_REPLAY_DIR");
+    }
+
+    let socket_path = get_socket_path("term-replay");
+    let log_path = get_log_path("term-replay");
+
+    assert_eq!(socket_path, PathBuf::from("/tmp/term-replay.sock"));
+    assert_eq!(log_path, PathBuf::from("/tmp/term-replay.log"));
+}
+
+#[test]
+fn test_session_name_with_special_characters() {
+    // Test session names with various characters
+    unsafe {
+        std::env::remove_var("TERM_REPLAY_DIR");
+    }
+
+    let socket_path = get_socket_path("my-work_session.123");
+    assert_eq!(socket_path, PathBuf::from("/tmp/my-work_session.123.sock"));
+
+    let socket_path = get_socket_path("dev");
+    assert_eq!(socket_path, PathBuf::from("/tmp/dev.sock"));
 }
