@@ -8,4 +8,16 @@ name = "term-tunnel"
 path = "src/main.rs"
 
 [dependencies]
-# Will be implemented in future phases
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+smux = { workspace = true }
+
+# Local crates
+term-core = { path = "../term-core" }
+term-session = { path = "../term-session" }
+term-protocol = { path = "../term-protocol" }
