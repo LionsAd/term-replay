@@ -289,17 +289,25 @@ fn create_new_pty_with_bash() -> Result<(std::os::unix::io::OwnedFd, nix::unistd
 
 /// PTY reader task that handles PTY output and manages PTY lifecycle
 async fn pty_reader_task(
-    pty_async_fd: Arc<AsyncFd<RawFd>>,
+    pty_async_fd: Arc<AsyncFd<std::os::unix::io::OwnedFd>>,
     tx: broadcast::Sender<Vec<u8>>,
     debug_raw_log: Option<Arc<Mutex<TokioFile>>>,
     log_file: Arc<Mutex<TokioFile>>,
-    pty_async_shared: Arc<Mutex<Option<Arc<AsyncFd<RawFd>>>>>,
+    pty_async_shared: Arc<Mutex<Option<Arc<AsyncFd<std::os::unix::io::OwnedFd>>>>>,
 ) {
+    let pty_fd = pty_async_fd.as_raw_fd();
+    tracing::info!("📖 PTY reader task started for fd {}", pty_fd);
+
     let mut buf = [0u8; 1024];
     let mut parser = EscapeParser::new();
     let mut terminal_mode = TerminalMode::Normal;
+    let mut read_count = 0;
 
     loop {
+        tracing::debug!(
+            "🔄 PTY reader loop iteration {}, waiting for readable...",
+            read_count
+        );
         let mut guard = pty_async_fd.readable().await.unwrap();
         match guard.try_io(|inner| {
             let fd = inner.as_raw_fd();
@@ -317,12 +325,19 @@ async fn pty_reader_task(
             }
         }) {
             Ok(Ok(0)) => {
-                tracing::info!("PTY master EOF. Shell process exited.");
+                tracing::warn!(
+                    "🔚 PTY fd {} EOF after {} reads. Shell process exited!",
+                    pty_fd,
+                    read_count
+                );
+                tracing::info!("💡 This indicates bash exited (normal or abnormal)");
 
                 // Clear the shared PTY reference - back to "no PTY" state
                 {
+                    tracing::debug!("🧹 Clearing PTY from shared state...");
                     let mut pty_guard = pty_async_shared.lock().await;
                     *pty_guard = None;
+                    tracing::debug!("✅ PTY cleared from shared state");
                 }
 
                 // Write an exit message to the main log
@@ -342,11 +357,19 @@ async fn pty_reader_task(
                 // Broadcast exit message and then close the channel to disconnect all clients
                 let _ = tx.send(exit_message.as_bytes().to_vec());
 
-                tracing::info!("PTY reader task exiting - server ready for new connections");
+                tracing::info!("🏁 PTY reader task exiting - server ready for new connections");
                 break;
             }
             Ok(Ok(n)) => {
+                read_count += 1;
                 let data = buf[..n].to_vec();
+                tracing::debug!(
+                    "📥 Read {} bytes from PTY fd {} (read #{}): {:?}",
+                    n,
+                    pty_fd,
+                    read_count,
+                    String::from_utf8_lossy(&data)
+                );
 
                 // Raw debug logging - write ALL data unconditionally
                 if let Some(debug_log) = &debug_raw_log {
@@ -654,7 +677,11 @@ async fn server_main() -> Result<()> {
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
 
     // Track PTY state - None when no PTY exists, Some when PTY is active
-    let pty_async: Arc<Mutex<Option<Arc<AsyncFd<RawFd>>>>> = Arc::new(Mutex::new(None));
+    let pty_async: Arc<Mutex<Option<Arc<AsyncFd<std::os::unix::io::OwnedFd>>>>> =
+        Arc::new(Mutex::new(None));
+
+    // Flag to prevent multiple concurrent PTY creation attempts
+    let pty_creating = Arc::new(tokio::sync::Semaphore::new(1));
 
     // 3. PTY Reader Task will be created on-demand when first client connects
 
@@ -676,77 +703,119 @@ async fn server_main() -> Result<()> {
             // Accept new client connections
             result = listener.accept() => {
                 match result {
-                    Ok((stream, _)) => {
-                        tracing::info!("New client connected");
+                    Ok((stream, addr)) => {
+                        tracing::info!("🔌 New client connected from {:?}", addr);
 
-                        // Check if we need to create a PTY
+                        // Check if we need to create a PTY - use a more robust check
                         let needs_pty = {
                             let pty_guard = pty_async.lock().await;
+                            let has_pty = pty_guard.is_some();
+                            tracing::debug!("📊 PTY check: has_pty={}", has_pty);
                             pty_guard.is_none()
                         };
 
                         if needs_pty {
-                            tracing::info!("No PTY exists, creating new PTY with bash...");
+                            tracing::info!("🚀 No PTY exists, attempting to create new PTY with bash...");
 
-                            // Create new PTY with bash
-                            match create_new_pty_with_bash() {
-                                Ok((pty_master, child_pid)) => {
-                                    tracing::info!("Created PTY with bash, PID: {}", child_pid);
+                            // Use semaphore to ensure only one PTY creation at a time
+                            if let Ok(_permit) = pty_creating.try_acquire() {
+                                tracing::debug!("🔒 Acquired PTY creation semaphore");
 
-                                    // Make PTY non-blocking
-                                    let pty_master_fd = pty_master.as_raw_fd();
-                                    nix::fcntl::fcntl(
-                                        pty_master_fd,
-                                        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-                                    )?;
+                                // Double-check PTY still doesn't exist (race condition protection)
+                                let still_needs_pty = {
+                                    let pty_guard = pty_async.lock().await;
+                                    let needs = pty_guard.is_none();
+                                    tracing::debug!("🔄 Double-check PTY needed: {}", needs);
+                                    needs
+                                };
 
-                                    // Apply window size
-                                    window_manager.apply_to_fd(pty_master_fd)?;
+                                if still_needs_pty {
+                                    tracing::info!("✅ Confirmed PTY creation needed, creating new PTY with bash...");
 
-                                    // Create async wrapper
-                                    let pty_async_fd = Arc::new(AsyncFd::new(pty_master_fd)?);
+                                    // Create new PTY with bash
+                                    match create_new_pty_with_bash() {
+                                        Ok((pty_master, child_pid)) => {
+                                            let pty_master_fd = pty_master.as_raw_fd();
+                                            tracing::info!("🎯 SUCCESS: Created PTY with bash, PID: {}, FD: {}",
+                                                child_pid, pty_master_fd);
 
-                                    // Store in shared state
-                                    {
-                                        let mut pty_guard = pty_async.lock().await;
-                                        *pty_guard = Some(pty_async_fd.clone());
+                                            // Make PTY non-blocking
+                                            tracing::debug!("⚙️  Making PTY fd {} non-blocking...", pty_master_fd);
+                                            nix::fcntl::fcntl(
+                                                pty_master_fd,
+                                                nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+                                            )?;
+
+                                            // Apply window size
+                                            tracing::debug!("📐 Applying window size to PTY fd {}...", pty_master_fd);
+                                            window_manager.apply_to_fd(pty_master_fd)?;
+
+                                            // Create async wrapper - PASS OWNED FD TO KEEP IT ALIVE
+                                            tracing::debug!("🔄 Creating AsyncFd wrapper for PTY fd {}...", pty_master_fd);
+                                            let pty_async_fd = Arc::new(AsyncFd::new(pty_master)?);
+
+                                            // Store in shared state
+                                            {
+                                                tracing::debug!("💾 Storing PTY in shared state...");
+                                                let mut pty_guard = pty_async.lock().await;
+                                                *pty_guard = Some(pty_async_fd.clone());
+                                                tracing::debug!("✅ PTY stored in shared state successfully");
+                                            }
+
+                                            // Start PTY reader task
+                                            tracing::info!("🚀 Starting PTY reader task for PID {}...", child_pid);
+                                            let tx_clone = tx.clone();
+                                            let debug_raw_log_clone = debug_raw_log.clone();
+                                            let log_file_clone = log_file.clone();
+                                            let pty_async_clone = pty_async.clone();
+                                            tokio::spawn(pty_reader_task(
+                                                pty_async_fd,
+                                                tx_clone,
+                                                debug_raw_log_clone,
+                                                log_file_clone,
+                                                pty_async_clone,
+                                            ));
+                                            tracing::info!("✅ PTY reader task started successfully");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("❌ FAILED to create PTY: {}", e);
+                                            continue;
+                                        }
                                     }
-
-                                    // Start PTY reader task
-                                    let tx_clone = tx.clone();
-                                    let debug_raw_log_clone = debug_raw_log.clone();
-                                    let log_file_clone = log_file.clone();
-                                    let pty_async_clone = pty_async.clone();
-                                    tokio::spawn(pty_reader_task(
-                                        pty_async_fd,
-                                        tx_clone,
-                                        debug_raw_log_clone,
-                                        log_file_clone,
-                                        pty_async_clone,
-                                    ));
+                                } else {
+                                    tracing::info!("ℹ️  PTY was created by another client, using existing PTY");
                                 }
-                                Err(e) => {
-                                    tracing::error!("Failed to create PTY: {}", e);
-                                    continue;
-                                }
+                            } else {
+                                tracing::info!("⏳ PTY creation in progress by another client, will use existing PTY");
                             }
+                        } else {
+                            tracing::info!("♻️  Using existing PTY for new client");
                         }
 
                         // Get current PTY for this client
                         let pty_async_clone = {
                             let pty_guard = pty_async.lock().await;
-                            pty_guard.clone()
+                            let pty_ref = pty_guard.clone();
+                            tracing::debug!("📋 Retrieved PTY for client: has_pty={}", pty_ref.is_some());
+                            pty_ref
                         };
 
                         let input_log_clone = input_log.clone();
                         let mut rx = tx.subscribe();
+                        tracing::debug!("📺 Created broadcast receiver for client");
 
+                        tracing::info!("🎬 Spawning client handler task...");
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, pty_async_clone, input_log_clone, &mut rx).await {
-                                tracing::warn!("Client disconnected with error: {}", e);
-                            } else {
-                                tracing::info!("Client disconnected gracefully.");
+                            tracing::debug!("👤 Client handler task started");
+                            match handle_client(stream, pty_async_clone, input_log_clone, &mut rx).await {
+                                Err(e) => {
+                                    tracing::warn!("❌ Client disconnected with error: {}", e);
+                                }
+                                Ok(_) => {
+                                    tracing::info!("✅ Client disconnected gracefully");
+                                }
                             }
+                            tracing::debug!("👤 Client handler task ended");
                         });
                     }
                     Err(e) => {
@@ -766,28 +835,51 @@ async fn server_main() -> Result<()> {
 // This function manages a single client's lifecycle.
 async fn handle_client(
     stream: UnixStream,
-    pty_async: Option<Arc<AsyncFd<RawFd>>>,
+    pty_async: Option<Arc<AsyncFd<std::os::unix::io::OwnedFd>>>,
     input_log: Option<Arc<Mutex<TokioFile>>>,
     rx: &mut broadcast::Receiver<Vec<u8>>,
 ) -> Result<()> {
+    let pty_info = if let Some(ref pty) = pty_async {
+        format!("fd {}", pty.as_raw_fd())
+    } else {
+        "None".to_string()
+    };
+    tracing::info!("🎭 Client handler starting with PTY: {}", pty_info);
+
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
 
     // Initialize input parser for this client
     let mut input_parser = InputParser::new();
 
     // a. Replay history
-    let mut history_file = TokioFile::open(LOG_PATH).await?;
-    tokio::io::copy(&mut history_file, &mut client_writer).await?;
+    tracing::debug!("📜 Attempting to replay history from {}", LOG_PATH);
+    match TokioFile::open(LOG_PATH).await {
+        Ok(mut history_file) => {
+            let bytes_copied = tokio::io::copy(&mut history_file, &mut client_writer).await?;
+            tracing::info!("📜 Replayed {} bytes of history to client", bytes_copied);
+        }
+        Err(e) => {
+            tracing::debug!("📜 No history file found ({}), starting fresh", e);
+        }
+    }
 
+    tracing::debug!("🔄 Starting client event loop...");
+    let mut loop_count = 0;
     loop {
+        loop_count += 1;
         let mut client_buf = [0u8; 1024];
+        tracing::debug!("🔄 Client event loop iteration {}", loop_count);
 
         tokio::select! {
             // b. Read from client (stdin) and write to PTY
             result = client_reader.read(&mut client_buf) => {
                 match result {
-                    Ok(0) => break, // Client disconnected
+                    Ok(0) => {
+                        tracing::info!("🔌 Client disconnected (EOF)");
+                        break;
+                    }
                     Ok(n) => {
+                        tracing::debug!("⌨️  Client sent {} bytes: {:?}", n, String::from_utf8_lossy(&client_buf[..n]));
                         let input_data = &client_buf[..n];
 
                         // Process input through state machine to detect resize sequences
@@ -863,10 +955,12 @@ async fn handle_client(
             result = rx.recv() => {
                 match result {
                     Ok(data) => {
+                        tracing::debug!("📺 Received {} bytes from broadcast: {:?}", data.len(), String::from_utf8_lossy(&data));
                         client_writer.write_all(&data).await?;
+                        tracing::debug!("📤 Forwarded {} bytes to client", data.len());
                     }
                     Err(e) => {
-                        tracing::error!("Broadcast channel error: {}", e);
+                        tracing::error!("❌ Broadcast channel error: {}", e);
                         break;
                     }
                 }
@@ -1002,7 +1096,7 @@ async fn client_main(detach_char: u8) -> Result<()> {
             result = server_reader.read(&mut server_buf) => {
                 match result {
                     Ok(0) => {
-                        tracing::info!("Connection to server closed");
+                        tracing::debug!("Connection to server closed");
                         break;
                     }
                     Ok(n) => {
@@ -1031,7 +1125,10 @@ async fn client_main(detach_char: u8) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Default to INFO level, but keep all debug messages in code for troubleshooting
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
     let cli = Cli::parse();
 
     match cli.command {
