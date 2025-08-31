@@ -1285,10 +1285,13 @@ async fn client_main(detach_char: u8, session_name: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Default to INFO level, but keep all debug messages in code for troubleshooting
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // Initialize logging based on environment variables
+    // Defaults to ERROR level for clean server operation while still showing critical issues
+    // Set RUST_LOG environment variable to control logging level
+    // Examples: RUST_LOG=info, RUST_LOG=debug, RUST_LOG=term_replay=debug
+    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string());
+
+    tracing_subscriber::fmt().with_env_filter(log_level).init();
     let cli = Cli::parse();
 
     let result = match cli.command {
