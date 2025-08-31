@@ -1,0 +1,24 @@
+[package]
+name = "term-replay"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "term-replay"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+nix = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = { workspace = true }
+chrono = { workspace = true }
+
+# Local crates
+term-core = { path = "../term-core" }
+term-session = { path = "../term-session" }
+term-protocol = { path = "../term-protocol" }
