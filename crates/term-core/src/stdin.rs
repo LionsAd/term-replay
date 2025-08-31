@@ -25,7 +25,7 @@ impl StdinReader {
 
         // Spawn blocking thread for stdin using select() to wait on multiple FDs
         let handle = std::thread::spawn(move || {
-            use nix::sys::select::{FdSet, select};
+            use nix::sys::select::{select, FdSet};
             use std::os::unix::io::AsRawFd;
 
             let stdin_fd = std::io::stdin().as_raw_fd();

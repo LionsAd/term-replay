@@ -1,14 +1,12 @@
 use anyhow::Result;
-use nix::pty::{ForkptyResult, forkpty};
+use nix::pty::{forkpty, ForkptyResult};
 use nix::unistd;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use tracing;
 
 /// Create a new PTY with command - returns (pty_master, child_pid)
-pub fn create_new_pty_with_command(
-    command: &[String],
-) -> Result<(OwnedFd, nix::unistd::Pid)> {
+pub fn create_new_pty_with_command(command: &[String]) -> Result<(OwnedFd, nix::unistd::Pid)> {
     // Validate command
     if command.is_empty() {
         anyhow::bail!("Command cannot be empty");

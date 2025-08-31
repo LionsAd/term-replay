@@ -44,10 +44,11 @@ mod tests {
 
     #[test]
     fn test_path_generation_with_default_dir() {
+        // Store original value
+        let original = std::env::var("TERM_REPLAY_DIR");
+
         // Test with default directory (/tmp)
-        unsafe {
-            std::env::remove_var("TERM_REPLAY_DIR");
-        }
+        std::env::remove_var("TERM_REPLAY_DIR");
 
         let socket_path = get_socket_path("test-session");
         let log_path = get_log_path("test-session");
@@ -58,14 +59,21 @@ mod tests {
         assert_eq!(log_path, PathBuf::from("/tmp/test-session.log"));
         assert_eq!(debug_path, PathBuf::from("/tmp/test-session-raw.log"));
         assert_eq!(input_path, PathBuf::from("/tmp/test-session-input.log"));
+
+        // Restore original value
+        match original {
+            Ok(value) => std::env::set_var("TERM_REPLAY_DIR", value),
+            Err(_) => {} // It was already unset
+        }
     }
 
     #[test]
     fn test_path_generation_with_custom_dir() {
+        // Store original value
+        let original = std::env::var("TERM_REPLAY_DIR");
+
         // Test with custom directory via environment variable
-        unsafe {
-            std::env::set_var("TERM_REPLAY_DIR", "/var/run/user/1000");
-        }
+        std::env::set_var("TERM_REPLAY_DIR", "/var/run/user/1000");
 
         let socket_path = get_socket_path("mysession");
         let log_path = get_log_path("mysession");
@@ -86,9 +94,10 @@ mod tests {
             PathBuf::from("/var/run/user/1000/mysession-input.log")
         );
 
-        // Clean up
-        unsafe {
-            std::env::remove_var("TERM_REPLAY_DIR");
+        // Restore original value
+        match original {
+            Ok(value) => std::env::set_var("TERM_REPLAY_DIR", value),
+            Err(_) => std::env::remove_var("TERM_REPLAY_DIR"),
         }
     }
 }

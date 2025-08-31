@@ -10,4 +10,5 @@ nix = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+libc = { workspace = true }
 term-core = { path = "../term-core" }

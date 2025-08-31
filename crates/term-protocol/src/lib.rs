@@ -1,3 +1,4 @@
+use anyhow;
 use serde::{Deserialize, Serialize};
 
 /// Parse detach character from string (e.g., "^\" -> Ctrl-\, "^?" -> DEL)
@@ -76,14 +77,14 @@ mod tests {
     fn test_session_info_serialization() {
         let session = SessionInfo {
             id: "test-session".to_string(),
-            name: "test".to_string(), 
+            name: "test".to_string(),
             pid: 12345,
             created: "2025-01-01T00:00:00Z".to_string(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
         let deserialized: SessionInfo = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(session.id, deserialized.id);
         assert_eq!(session.name, deserialized.name);
         assert_eq!(session.pid, deserialized.pid);

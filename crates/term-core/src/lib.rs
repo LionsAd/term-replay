@@ -7,5 +7,5 @@ pub mod winsize;
 pub use pty::*;
 pub use signals::SignalManager;
 pub use stdin::StdinReader;
-pub use terminal::{TerminalState, is_terminal};
-pub use winsize::{WindowSize, WindowSizeManager, get_terminal_size};
+pub use terminal::{is_terminal, TerminalState};
+pub use winsize::{get_terminal_size, WindowSize, WindowSizeManager};

@@ -1,0 +1,11 @@
+[package]
+name = "term-tunnel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "term-tunnel"
+path = "src/main.rs"
+
+[dependencies]
+# Will be implemented in future phases

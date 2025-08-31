@@ -1,11 +1,10 @@
-use anyhow::Result;
+use chrono;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, unix::AsyncFd};
-use tokio::sync::{Mutex, broadcast};
+use tokio::io::{unix::AsyncFd, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{broadcast, Mutex};
 use tracing;
-use chrono;
-use term_core::apply_window_size_to_pty;
 
 use crate::parser::{EscapeParser, SequenceAction, TerminalMode};
 
