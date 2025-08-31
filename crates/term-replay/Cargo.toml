@@ -20,3 +20,7 @@ term-server = { path = "../term-server" }
 term-client = { path = "../term-client" }
 term-protocol = { path = "../term-protocol" }
 term-session = { path = "../term-session" }
+
+[lib]
+name = "term_replay"
+path = "src/lib.rs"

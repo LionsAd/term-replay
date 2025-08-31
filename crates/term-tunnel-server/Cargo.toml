@@ -23,3 +23,10 @@ chrono = { workspace = true }
 # Local crates
 term-protocol = { path = "../term-protocol" }
 term-session = { path = "../term-session" }
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[lib]
+name = "term_tunnel_server"
+path = "src/lib.rs"

@@ -21,3 +21,6 @@ smux = { workspace = true }
 term-core = { path = "../term-core" }
 term-session = { path = "../term-session" }
 term-protocol = { path = "../term-protocol" }
+
+[dev-dependencies]
+tempfile = "3.8"
