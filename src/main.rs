@@ -5,7 +5,7 @@ mod stdin;
 mod terminal;
 mod winsize;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nix::pty::{ForkptyResult, forkpty};
 use nix::unistd;
@@ -483,32 +483,352 @@ fn get_term_replay_dir() -> PathBuf {
     }
 }
 
+/// Internal function that generates socket path in specified directory
+fn get_socket_path_in_dir(socket_name: &str, base_dir: &Path) -> PathBuf {
+    let mut path = base_dir.to_path_buf();
+    path.push(format!("{}.sock", socket_name));
+    path
+}
+
 /// Generate socket path for a given session name
 fn get_socket_path(socket_name: &str) -> PathBuf {
-    let mut path = get_term_replay_dir();
-    path.push(format!("{}.sock", socket_name));
+    let base_dir = get_term_replay_dir();
+    get_socket_path_in_dir(socket_name, &base_dir)
+}
+
+/// Internal function that generates log path in specified directory
+fn get_log_path_in_dir(socket_name: &str, base_dir: &Path) -> PathBuf {
+    let mut path = base_dir.to_path_buf();
+    path.push(format!("{}.log", socket_name));
     path
 }
 
 /// Generate main log path for a given session name
 fn get_log_path(socket_name: &str) -> PathBuf {
-    let mut path = get_term_replay_dir();
-    path.push(format!("{}.log", socket_name));
+    let base_dir = get_term_replay_dir();
+    get_log_path_in_dir(socket_name, &base_dir)
+}
+
+/// Internal function that generates debug raw log path in specified directory
+fn get_debug_raw_log_path_in_dir(socket_name: &str, base_dir: &Path) -> PathBuf {
+    let mut path = base_dir.to_path_buf();
+    path.push(format!("{}-raw.log", socket_name));
     path
 }
 
 /// Generate debug raw log path for a given session name
 fn get_debug_raw_log_path(socket_name: &str) -> PathBuf {
-    let mut path = get_term_replay_dir();
-    path.push(format!("{}-raw.log", socket_name));
+    let base_dir = get_term_replay_dir();
+    get_debug_raw_log_path_in_dir(socket_name, &base_dir)
+}
+
+/// Internal function that generates input log path in specified directory
+fn get_input_log_path_in_dir(socket_name: &str, base_dir: &Path) -> PathBuf {
+    let mut path = base_dir.to_path_buf();
+    path.push(format!("{}-input.log", socket_name));
     path
 }
 
 /// Generate input log path for a given session name
 fn get_input_log_path(socket_name: &str) -> PathBuf {
-    let mut path = get_term_replay_dir();
-    path.push(format!("{}-input.log", socket_name));
+    let base_dir = get_term_replay_dir();
+    get_input_log_path_in_dir(socket_name, &base_dir)
+}
+
+/// Validate session name using allowlist pattern to prevent directory traversal and other attacks
+fn validate_session_name(session_name: &str) -> Result<()> {
+    // Check basic constraints first for better error messages
+    if session_name.is_empty() {
+        anyhow::bail!("Session name cannot be empty");
+    }
+
+    if session_name.len() > 100 {
+        anyhow::bail!(
+            "Session name too long (max 100 chars, got {}): '{}'",
+            session_name.len(),
+            session_name
+        );
+    }
+
+    // Use allowlist approach: only allow alphanumeric, hyphens, underscores, and dots (not at start)
+    // This prevents directory traversal, Unicode issues, and control characters
+    let is_valid_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.';
+
+    if !session_name.chars().all(is_valid_char) {
+        let mut invalid_chars: Vec<char> = session_name
+            .chars()
+            .filter(|c| !is_valid_char(*c))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        // Sort for deterministic error messages
+        invalid_chars.sort();
+        let invalid_chars_str: String = invalid_chars.into_iter().collect();
+        anyhow::bail!(
+            "Session name contains invalid characters: '{}'. Only alphanumeric, '-', '_', and '.' are allowed: '{}'",
+            invalid_chars_str,
+            session_name
+        );
+    }
+
+    // Don't allow starting with dot (hidden files) or hyphen (command-line confusion)
+    if session_name.starts_with('.') {
+        anyhow::bail!("Session name cannot start with '.': '{}'", session_name);
+    }
+
+    if session_name.starts_with('-') {
+        anyhow::bail!("Session name cannot start with '-': '{}'", session_name);
+    }
+
+    // Prevent directory traversal patterns
+    if session_name.contains("..") {
+        anyhow::bail!("Session name cannot contain '..': '{}'", session_name);
+    }
+
+    Ok(())
+}
+
+/// Internal function that generates PID file path in specified directory
+fn get_pid_file_path_in_dir(socket_name: &str, base_dir: &Path) -> PathBuf {
+    let mut path = base_dir.to_path_buf();
+    path.push(format!("{}.pid", socket_name));
     path
+}
+
+/// Generate PID file path for a given session name
+fn get_pid_file_path(socket_name: &str) -> PathBuf {
+    let base_dir = get_term_replay_dir();
+    get_pid_file_path_in_dir(socket_name, &base_dir)
+}
+
+/// Session state for smart takeover logic
+#[derive(Debug, PartialEq)]
+enum SessionState {
+    Available,          // No existing session
+    ActiveSession(u32), // Running server with PID
+    StaleSession(u32),  // Dead process, socket/PID exist
+    OrphanSocket,       // Socket exists, no PID file
+}
+
+/// Unix-only process existence check using kill(pid, 0)
+/// Returns true if process exists (even if we don't have permission to signal it)
+fn is_process_running(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true, // Process exists and we have permission to signal it
+        Err(nix::errno::Errno::EPERM) => true, // Process exists but we don't have permission - still running
+        Err(nix::errno::Errno::ESRCH) => false, // No such process
+        Err(e) => {
+            tracing::warn!("Unexpected error checking process {}: {}", pid, e);
+            false // Assume not running on other errors
+        }
+    }
+}
+
+/// Read PID from PID file, returning None if file doesn't exist or contains invalid data
+fn read_pid_file(pid_file_path: &Path) -> Option<u32> {
+    match std::fs::read_to_string(pid_file_path) {
+        Ok(contents) => match contents.trim().parse::<u32>() {
+            Ok(pid) => Some(pid),
+            Err(_) => {
+                tracing::warn!(
+                    "PID file {} contains invalid data: {:?}",
+                    pid_file_path.display(),
+                    contents
+                );
+                None
+            }
+        },
+        Err(_) => None, // File doesn't exist or can't be read
+    }
+}
+
+/// Check the current state of a session (socket + PID file)
+fn check_session_state(socket_path: &Path, pid_file_path: &Path) -> SessionState {
+    if !socket_path.exists() {
+        return SessionState::Available;
+    }
+
+    // Socket exists, check PID file
+    let pid = match read_pid_file(pid_file_path) {
+        Some(pid) => pid,
+        None => return SessionState::OrphanSocket,
+    };
+
+    // Test if process is actually running
+    if is_process_running(pid) {
+        SessionState::ActiveSession(pid)
+    } else {
+        SessionState::StaleSession(pid)
+    }
+}
+
+/// Clean up stale session files (socket and PID file)
+fn cleanup_stale_session(socket_path: &Path, pid_file_path: &Path) -> Result<()> {
+    // Remove stale socket - ignore NotFound errors (file may already be gone)
+    if let Err(e) = std::fs::remove_file(socket_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e).with_context(|| {
+                format!("Failed to remove stale socket: {}", socket_path.display())
+            });
+        }
+    }
+
+    // Remove stale PID file - ignore NotFound errors (file may already be gone)
+    if let Err(e) = std::fs::remove_file(pid_file_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to remove stale PID file: {}",
+                    pid_file_path.display()
+                )
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// RAII guard to ensure socket cleanup on drop
+struct SocketGuard {
+    path: PathBuf,
+    should_cleanup: bool,
+}
+
+impl SocketGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            should_cleanup: true,
+        }
+    }
+
+    /// Disable cleanup (call when server shuts down normally)
+    fn disarm(&mut self) {
+        self.should_cleanup = false;
+    }
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        if self.should_cleanup {
+            tracing::debug!("Cleaning up socket on drop: {}", self.path.display());
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                // Ignore NotFound errors - file may have been cleaned up already
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("Failed to cleanup socket on drop: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// RAII guard to ensure PID file cleanup on drop
+struct PidFileGuard {
+    path: PathBuf,
+    should_cleanup: bool,
+}
+
+impl PidFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            should_cleanup: true,
+        }
+    }
+
+    /// Disable cleanup (call when server shuts down normally)
+    fn disarm(&mut self) {
+        self.should_cleanup = false;
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if self.should_cleanup {
+            tracing::debug!("Cleaning up PID file on drop: {}", self.path.display());
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                // Ignore NotFound errors - file may have been cleaned up already
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("Failed to cleanup PID file on drop: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Create PID file securely with proper permissions, ensuring parent directory exists
+/// Uses atomic write (temp file + rename) to prevent partial reads
+fn create_pid_file(pid_file_path: &Path, pid: u32) -> Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+
+    // Ensure parent directory exists
+    if let Some(parent_dir) = pid_file_path.parent() {
+        if !parent_dir.exists() {
+            fs::create_dir_all(parent_dir).with_context(|| {
+                format!(
+                    "Failed to create parent directory for PID file: {}",
+                    parent_dir.display()
+                )
+            })?;
+            tracing::debug!(
+                "Created parent directory for PID file: {}",
+                parent_dir.display()
+            );
+        }
+    }
+
+    // Create temporary file in same directory for atomic rename
+    let temp_path = pid_file_path.with_extension("pid.tmp");
+
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut temp_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600) // Owner read/write only
+        .open(&temp_path)
+        .with_context(|| {
+            format!(
+                "Failed to create temporary PID file: {}",
+                temp_path.display()
+            )
+        })?;
+
+    // Write PID to temp file
+    temp_file
+        .write_all(pid.to_string().as_bytes())
+        .with_context(|| {
+            format!(
+                "Failed to write to temporary PID file: {}",
+                temp_path.display()
+            )
+        })?;
+    temp_file
+        .sync_all()
+        .with_context(|| format!("Failed to sync temporary PID file: {}", temp_path.display()))?;
+
+    // Close temp file before rename (required on some systems)
+    drop(temp_file);
+
+    // Atomically replace target file with temp file
+    fs::rename(&temp_path, pid_file_path).with_context(|| {
+        format!(
+            "Failed to rename temporary PID file {} to {}",
+            temp_path.display(),
+            pid_file_path.display()
+        )
+    })?;
+
+    tracing::info!(
+        "Created PID file: {} (PID: {})",
+        pid_file_path.display(),
+        pid
+    );
+    Ok(())
 }
 
 // Terminal mode tracking
@@ -690,6 +1010,9 @@ enum Commands {
 
 // SERVER LOGIC
 async fn server_main(session_name: &str, command: &[String]) -> Result<()> {
+    // Validate session name to prevent directory traversal attacks
+    validate_session_name(session_name)?;
+
     // Initialize signal manager for server mode
     let signal_manager = SignalManager::new(false);
     signal_manager.setup_server_signals()?;
@@ -702,22 +1025,61 @@ async fn server_main(session_name: &str, command: &[String]) -> Result<()> {
     let log_path = get_log_path(session_name);
     let debug_raw_log_path = get_debug_raw_log_path(session_name);
     let input_log_path = get_input_log_path(session_name);
+    let pid_file_path = get_pid_file_path(session_name);
 
-    // Check if session already exists
-    if socket_path.exists() {
-        anyhow::bail!(
-            "Session '{}' already exists (socket: {}). Please choose a different name or stop the existing session.",
-            session_name,
-            socket_path.display()
-        );
+    // Check session state and handle takeover logic
+    match check_session_state(&socket_path, &pid_file_path) {
+        SessionState::Available => {
+            // Normal startup - no existing session
+        }
+        SessionState::ActiveSession(pid) => {
+            anyhow::bail!(
+                "Session '{}' is active (PID: {}, socket: {}). Use a different session name or stop the existing server.",
+                session_name,
+                pid,
+                socket_path.display()
+            );
+        }
+        SessionState::StaleSession(pid) => {
+            tracing::warn!(
+                "Taking over stale session '{}' (dead PID: {}, socket: {}). Previous session logs preserved.",
+                session_name,
+                pid,
+                socket_path.display()
+            );
+            cleanup_stale_session(&socket_path, &pid_file_path)?;
+        }
+        SessionState::OrphanSocket => {
+            tracing::warn!(
+                "Taking over orphaned session '{}' (socket: {}, no PID file). Previous session logs preserved.",
+                session_name,
+                socket_path.display()
+            );
+            cleanup_stale_session(&socket_path, &pid_file_path)?;
+        }
     }
 
     // Clean up debug and input logs from previous runs (preserve main log)
-    if DEBUG_RAW_LOGGING && debug_raw_log_path.exists() {
-        std::fs::remove_file(&debug_raw_log_path)?;
+    if DEBUG_RAW_LOGGING {
+        if let Err(e) = std::fs::remove_file(&debug_raw_log_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to remove debug log: {}",
+                        debug_raw_log_path.display()
+                    )
+                });
+            }
+        }
     }
-    if INPUT_LOGGING && input_log_path.exists() {
-        std::fs::remove_file(&input_log_path)?;
+    if INPUT_LOGGING {
+        if let Err(e) = std::fs::remove_file(&input_log_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).with_context(|| {
+                    format!("Failed to remove input log: {}", input_log_path.display())
+                });
+            }
+        }
     }
 
     // 1. No PTY creation at startup - will be created on first client connection
@@ -780,7 +1142,20 @@ async fn server_main(session_name: &str, command: &[String]) -> Result<()> {
         tracing::debug!("🧟 Zombie reaper task exiting");
     });
 
-    let listener = UnixListener::bind(&socket_path)?;
+    // Bind the socket first - this is the critical section that must succeed
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("Failed to bind to socket: {}", socket_path.display()))?;
+
+    // Create RAII guard to ensure socket cleanup on any error after binding
+    let mut _socket_guard = SocketGuard::new(socket_path.clone());
+
+    // Only create PID file after successful socket binding to avoid orphaned PID files
+    let current_pid = std::process::id();
+    create_pid_file(&pid_file_path, current_pid)
+        .with_context(|| "Failed to create PID file after successful socket binding")?;
+
+    // Create RAII guard to ensure PID file cleanup on errors
+    let mut _pid_guard = PidFileGuard::new(pid_file_path.clone());
     let log_file = Arc::new(Mutex::new(
         OpenOptions::new()
             .create(true)
@@ -839,19 +1214,34 @@ async fn server_main(session_name: &str, command: &[String]) -> Result<()> {
                 tracing::info!("Received shutdown signal: {:?}, terminating server", sig);
             }
 
-            // Clean up socket file before shutdown
-            if socket_path.exists() {
-                if let Err(e) = std::fs::remove_file(&socket_path) {
+            // Clean up socket and PID files before shutdown
+            if let Err(e) = std::fs::remove_file(&socket_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(
                         "Failed to remove socket file {}: {}",
                         socket_path.display(),
                         e
                     );
-                } else {
-                    tracing::debug!("Cleaned up socket file: {}", socket_path.display());
                 }
+            } else {
+                tracing::debug!("Cleaned up socket file: {}", socket_path.display());
             }
 
+            if let Err(e) = std::fs::remove_file(&pid_file_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "Failed to remove PID file {}: {}",
+                        pid_file_path.display(),
+                        e
+                    );
+                }
+            } else {
+                tracing::debug!("Cleaned up PID file: {}", pid_file_path.display());
+            }
+
+            // Disarm the guards since we're cleaning up manually
+            _socket_guard.disarm();
+            _pid_guard.disarm();
             return Ok(());
         }
 
@@ -1686,80 +2076,120 @@ mod tests {
 
     #[test]
     fn test_path_generation_with_default_dir() {
-        // Test with default directory (/tmp)
-        unsafe {
-            std::env::remove_var("TERM_REPLAY_DIR");
-        }
-
+        // Test with default directory - just verify filename patterns without env manipulation
+        // Avoids parallel test issues and /tmp assumptions
         let socket_path = get_socket_path("test-session");
         let log_path = get_log_path("test-session");
         let debug_path = get_debug_raw_log_path("test-session");
         let input_path = get_input_log_path("test-session");
+        let pid_path = get_pid_file_path("test-session");
 
-        assert_eq!(socket_path, PathBuf::from("/tmp/test-session.sock"));
-        assert_eq!(log_path, PathBuf::from("/tmp/test-session.log"));
-        assert_eq!(debug_path, PathBuf::from("/tmp/test-session-raw.log"));
-        assert_eq!(input_path, PathBuf::from("/tmp/test-session-input.log"));
+        // Verify filename patterns without assuming specific base directory
+        assert!(socket_path.to_string_lossy().ends_with("test-session.sock"));
+        assert!(log_path.to_string_lossy().ends_with("test-session.log"));
+        assert!(
+            debug_path
+                .to_string_lossy()
+                .ends_with("test-session-raw.log")
+        );
+        assert!(
+            input_path
+                .to_string_lossy()
+                .ends_with("test-session-input.log")
+        );
+        assert!(pid_path.to_string_lossy().ends_with("test-session.pid"));
     }
 
     #[test]
     fn test_path_generation_with_custom_dir() {
-        // Test with custom directory via environment variable
+        use tempfile::tempdir;
+
+        // Test with custom directory using tempdir - no global state changes
+        let temp_dir = tempdir().unwrap();
+        let base_path = temp_dir.path();
+
+        let socket_path = get_socket_path_in_dir("mysession", base_path);
+        let log_path = get_log_path_in_dir("mysession", base_path);
+        let debug_path = get_debug_raw_log_path_in_dir("mysession", base_path);
+        let input_path = get_input_log_path_in_dir("mysession", base_path);
+
+        assert_eq!(socket_path, base_path.join("mysession.sock"));
+        assert_eq!(log_path, base_path.join("mysession.log"));
+        assert_eq!(debug_path, base_path.join("mysession-raw.log"));
+        assert_eq!(input_path, base_path.join("mysession-input.log"));
+
+        // No cleanup needed - tempdir handles it automatically
+    }
+
+    #[test]
+    fn test_term_replay_dir_environment_variable() {
+        // Test that TERM_REPLAY_DIR environment variable is respected
+        let old_value = std::env::var("TERM_REPLAY_DIR").ok();
+        let custom_dir = "/var/run/user/1000";
+
+        // SAFETY: Setting environment variables in tests is safe as long as:
+        // 1. We restore the original value afterward
+        // 2. We're only modifying test-specific variables
+        // 3. This is a single-threaded test operation
+        // Note: This can still race with parallel tests, but that's an acceptable test limitation
         unsafe {
-            std::env::set_var("TERM_REPLAY_DIR", "/var/run/user/1000");
+            std::env::set_var("TERM_REPLAY_DIR", custom_dir);
         }
 
-        let socket_path = get_socket_path("mysession");
-        let log_path = get_log_path("mysession");
-        let debug_path = get_debug_raw_log_path("mysession");
-        let input_path = get_input_log_path("mysession");
+        let socket_path = get_socket_path("env-test");
+        let log_path = get_log_path("env-test");
+        let debug_path = get_debug_raw_log_path("env-test");
+        let input_path = get_input_log_path("env-test");
+        let pid_path = get_pid_file_path("env-test");
 
+        // Verify paths use the custom directory from environment variable
         assert_eq!(
             socket_path,
-            PathBuf::from("/var/run/user/1000/mysession.sock")
+            PathBuf::from("/var/run/user/1000/env-test.sock")
         );
-        assert_eq!(log_path, PathBuf::from("/var/run/user/1000/mysession.log"));
+        assert_eq!(log_path, PathBuf::from("/var/run/user/1000/env-test.log"));
         assert_eq!(
             debug_path,
-            PathBuf::from("/var/run/user/1000/mysession-raw.log")
+            PathBuf::from("/var/run/user/1000/env-test-raw.log")
         );
         assert_eq!(
             input_path,
-            PathBuf::from("/var/run/user/1000/mysession-input.log")
+            PathBuf::from("/var/run/user/1000/env-test-input.log")
         );
+        assert_eq!(pid_path, PathBuf::from("/var/run/user/1000/env-test.pid"));
 
-        // Clean up
+        // Restore original environment to avoid affecting other tests
+        // SAFETY: Same safety rationale as above - restoring original state
         unsafe {
-            std::env::remove_var("TERM_REPLAY_DIR");
+            match old_value {
+                Some(value) => std::env::set_var("TERM_REPLAY_DIR", value),
+                None => std::env::remove_var("TERM_REPLAY_DIR"),
+            }
         }
     }
 
     #[test]
     fn test_default_session_name() {
-        // Test default session name behavior
-        unsafe {
-            std::env::remove_var("TERM_REPLAY_DIR");
-        }
-
+        // Test default session name behavior - no environment manipulation needed
         let socket_path = get_socket_path("term-replay");
         let log_path = get_log_path("term-replay");
 
-        assert_eq!(socket_path, PathBuf::from("/tmp/term-replay.sock"));
-        assert_eq!(log_path, PathBuf::from("/tmp/term-replay.log"));
+        assert!(socket_path.to_string_lossy().ends_with("term-replay.sock"));
+        assert!(log_path.to_string_lossy().ends_with("term-replay.log"));
     }
 
     #[test]
     fn test_session_name_with_special_characters() {
-        // Test session names with various characters
-        unsafe {
-            std::env::remove_var("TERM_REPLAY_DIR");
-        }
-
+        // Test session names with various characters - no environment manipulation needed
         let socket_path = get_socket_path("my-work_session.123");
-        assert_eq!(socket_path, PathBuf::from("/tmp/my-work_session.123.sock"));
+        assert!(
+            socket_path
+                .to_string_lossy()
+                .ends_with("my-work_session.123.sock")
+        );
 
         let socket_path = get_socket_path("dev");
-        assert_eq!(socket_path, PathBuf::from("/tmp/dev.sock"));
+        assert!(socket_path.to_string_lossy().ends_with("dev.sock"));
     }
 
     #[test]
@@ -1898,5 +2328,625 @@ mod tests {
             let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
             let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
         }
+    }
+
+    // Helper function to get a PID that's guaranteed not to exist
+    // Uses a short-lived child process that exits immediately
+    fn get_stale_pid() -> u32 {
+        use std::process::Command;
+
+        // Spawn a process that exits immediately
+        let child = Command::new("true")
+            .spawn()
+            .expect("Failed to spawn test process");
+        let pid = child.id();
+
+        // Wait for it to exit
+        let mut child = child;
+        child.wait().expect("Failed to wait for test process");
+
+        // Now we have a PID that definitely existed but is now dead
+        pid
+    }
+
+    #[test]
+    fn test_pid_file_path_generation() {
+        use tempfile::tempdir;
+
+        // Test with default directory - no environment manipulation needed
+        let pid_file_path = get_pid_file_path("test-session");
+        assert!(
+            pid_file_path
+                .to_string_lossy()
+                .ends_with("test-session.pid")
+        );
+
+        // Test with custom directory using tempdir - no global state changes
+        let temp_dir = tempdir().unwrap();
+        let pid_file_path = get_pid_file_path_in_dir("mysession", temp_dir.path());
+
+        assert!(pid_file_path.to_string_lossy().ends_with("mysession.pid"));
+        assert!(pid_file_path.starts_with(temp_dir.path()));
+
+        // No cleanup needed - tempdir handles it automatically
+    }
+
+    #[test]
+    fn test_session_state_detection() {
+        // Test basic session state logic without actually creating files
+        // This tests the enum and basic logic structure
+        assert_eq!(SessionState::Available, SessionState::Available);
+        assert_ne!(SessionState::Available, SessionState::OrphanSocket);
+
+        // Test that we can construct the variants
+        let _active = SessionState::ActiveSession(12345);
+        let _stale = SessionState::StaleSession(12345);
+        let _orphan = SessionState::OrphanSocket;
+    }
+
+    #[test]
+    fn test_read_pid_file_edge_cases() {
+        use std::fs;
+        use tempfile::{NamedTempFile, tempdir};
+
+        // Test non-existent file using tempdir
+        let temp_dir = tempdir().unwrap();
+        let non_existent = temp_dir.path().join("non_existent_pid_file.pid");
+        assert_eq!(read_pid_file(&non_existent), None);
+
+        // Test valid PID file
+        let temp_file = NamedTempFile::new().unwrap();
+        fs::write(temp_file.path(), "12345").unwrap();
+        assert_eq!(read_pid_file(temp_file.path()), Some(12345));
+
+        // Test invalid PID file (non-numeric)
+        let temp_file2 = NamedTempFile::new().unwrap();
+        fs::write(temp_file2.path(), "not_a_number").unwrap();
+        assert_eq!(read_pid_file(temp_file2.path()), None);
+
+        // Test empty PID file
+        let temp_file3 = NamedTempFile::new().unwrap();
+        fs::write(temp_file3.path(), "").unwrap();
+        assert_eq!(read_pid_file(temp_file3.path()), None);
+
+        // Test whitespace handling
+        let temp_file4 = NamedTempFile::new().unwrap();
+        fs::write(temp_file4.path(), "  54321  \n").unwrap();
+        assert_eq!(read_pid_file(temp_file4.path()), Some(54321));
+    }
+
+    #[test]
+    fn test_session_name_validation() {
+        // Valid session names
+        assert!(validate_session_name("valid-session").is_ok());
+        assert!(validate_session_name("session123").is_ok());
+        assert!(validate_session_name("my_session").is_ok());
+        assert!(validate_session_name("session.backup").is_ok());
+        assert!(validate_session_name("a").is_ok()); // single character
+        assert!(validate_session_name("ABC123").is_ok()); // uppercase
+        assert!(validate_session_name("test-123_session.v2").is_ok()); // complex valid name
+
+        // Invalid session names - empty
+        assert!(validate_session_name("").is_err());
+
+        // Invalid session names - starts with forbidden characters
+        assert!(validate_session_name(".hidden-session").is_err());
+        assert!(validate_session_name("-starts-with-dash").is_err());
+
+        // Invalid session names - contains forbidden characters
+        assert!(validate_session_name("session/with/slash").is_err());
+        assert!(validate_session_name("session\\with\\backslash").is_err());
+        assert!(validate_session_name("session with space").is_err());
+        assert!(validate_session_name("session@email").is_err());
+        assert!(validate_session_name("session#hash").is_err());
+        assert!(validate_session_name("session$dollar").is_err());
+        assert!(validate_session_name("session%percent").is_err());
+        assert!(validate_session_name("session^caret").is_err());
+        assert!(validate_session_name("session&ampersand").is_err());
+        assert!(validate_session_name("session*asterisk").is_err());
+        assert!(validate_session_name("session(paren").is_err());
+        assert!(validate_session_name("session)paren").is_err());
+        assert!(validate_session_name("session+plus").is_err());
+        assert!(validate_session_name("session=equals").is_err());
+        assert!(validate_session_name("session[bracket").is_err());
+        assert!(validate_session_name("session]bracket").is_err());
+        assert!(validate_session_name("session{brace").is_err());
+        assert!(validate_session_name("session}brace").is_err());
+        assert!(validate_session_name("session|pipe").is_err());
+        assert!(validate_session_name("session:colon").is_err());
+        assert!(validate_session_name("session;semicolon").is_err());
+        assert!(validate_session_name("session\"quote").is_err());
+        assert!(validate_session_name("session'apostrophe").is_err());
+        assert!(validate_session_name("session<less").is_err());
+        assert!(validate_session_name("session>greater").is_err());
+        assert!(validate_session_name("session,comma").is_err());
+        assert!(validate_session_name("session?question").is_err());
+        assert!(validate_session_name("session`backtick").is_err());
+        assert!(validate_session_name("session~tilde").is_err());
+
+        // Invalid session names - directory traversal
+        assert!(validate_session_name("session..with..dots").is_err());
+        assert!(validate_session_name("..").is_err());
+        assert!(validate_session_name("session..").is_err());
+        assert!(validate_session_name("..session").is_err());
+
+        // Invalid session names - Unicode and control characters
+        assert!(validate_session_name("session🎉emoji").is_err());
+        assert!(validate_session_name("sessionñunicode").is_err());
+        assert!(validate_session_name("session\t\ttab").is_err());
+        assert!(validate_session_name("session\n\nnewline").is_err());
+        assert!(validate_session_name("session\r\nwindows").is_err());
+
+        // Too long session name
+        let long_name = "a".repeat(101);
+        assert!(validate_session_name(&long_name).is_err());
+
+        // Maximum allowed length should work
+        let max_name = "a".repeat(100);
+        assert!(validate_session_name(&max_name).is_ok());
+    }
+
+    #[test]
+    fn test_socket_guard_cleanup() {
+        use tempfile::NamedTempFile;
+
+        // Create a temporary file to simulate a socket
+        let temp_file = NamedTempFile::new().unwrap();
+        let socket_path = temp_file.path().to_path_buf();
+
+        // Ensure the file exists initially
+        assert!(socket_path.exists());
+
+        {
+            // Create guard - should clean up when dropped
+            let _guard = SocketGuard::new(socket_path.clone());
+            assert!(socket_path.exists()); // File should still exist
+        } // Guard drops here
+
+        // File should be cleaned up after guard drop
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn test_socket_guard_disarm() {
+        use tempfile::NamedTempFile;
+
+        // Create a temporary file to simulate a socket
+        let temp_file = NamedTempFile::new().unwrap();
+        let socket_path = temp_file.path().to_path_buf();
+
+        // Ensure the file exists initially
+        assert!(socket_path.exists());
+
+        {
+            let mut guard = SocketGuard::new(socket_path.clone());
+            guard.disarm(); // Disable cleanup
+        } // Guard drops here but shouldn't clean up
+
+        // File should still exist after disarmed guard drop
+        assert!(socket_path.exists());
+    }
+
+    #[test]
+    fn test_check_session_state_available() {
+        use tempfile::tempdir;
+
+        // Test SessionState::Available - no files exist
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        let state = check_session_state(&socket_path, &pid_file_path);
+        assert_eq!(state, SessionState::Available);
+    }
+
+    #[test]
+    fn test_check_session_state_orphan_socket() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test SessionState::OrphanSocket - socket exists, no PID file
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        // Create socket file but no PID file
+        fs::write(&socket_path, "").unwrap();
+
+        let state = check_session_state(&socket_path, &pid_file_path);
+        assert_eq!(state, SessionState::OrphanSocket);
+    }
+
+    #[test]
+    fn test_check_session_state_orphan_socket_invalid_pid() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test SessionState::OrphanSocket - socket exists, PID file has invalid data
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        // Create socket file and PID file with invalid data
+        fs::write(&socket_path, "").unwrap();
+        fs::write(&pid_file_path, "not_a_number").unwrap();
+
+        let state = check_session_state(&socket_path, &pid_file_path);
+        assert_eq!(state, SessionState::OrphanSocket);
+    }
+
+    #[test]
+    fn test_check_session_state_active_session() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test SessionState::ActiveSession - socket exists, PID exists and process is running
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        // Create socket file and PID file with our own PID (guaranteed to be running)
+        fs::write(&socket_path, "").unwrap();
+        let current_pid = std::process::id();
+        fs::write(&pid_file_path, current_pid.to_string()).unwrap();
+
+        let state = check_session_state(&socket_path, &pid_file_path);
+        assert_eq!(state, SessionState::ActiveSession(current_pid));
+    }
+
+    #[test]
+    fn test_check_session_state_stale_session() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test SessionState::StaleSession - socket exists, PID exists but process is dead
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        // Create socket file and PID file with a PID that's guaranteed to be stale
+        fs::write(&socket_path, "").unwrap();
+        let stale_pid = get_stale_pid();
+        fs::write(&pid_file_path, stale_pid.to_string()).unwrap();
+
+        let state = check_session_state(&socket_path, &pid_file_path);
+        assert_eq!(state, SessionState::StaleSession(stale_pid));
+    }
+
+    #[test]
+    fn test_cleanup_stale_session() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test cleanup_stale_session removes both socket and PID files
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        // Create both files
+        fs::write(&socket_path, "socket data").unwrap();
+        fs::write(&pid_file_path, "12345").unwrap();
+
+        // Verify files exist
+        assert!(socket_path.exists());
+        assert!(pid_file_path.exists());
+
+        // Clean up
+        cleanup_stale_session(&socket_path, &pid_file_path).unwrap();
+
+        // Verify files are gone
+        assert!(!socket_path.exists());
+        assert!(!pid_file_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_stale_session_partial_files() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test cleanup_stale_session handles missing files gracefully
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        // Create only socket file
+        fs::write(&socket_path, "socket data").unwrap();
+        // PID file doesn't exist
+
+        // Verify initial state
+        assert!(socket_path.exists());
+        assert!(!pid_file_path.exists());
+
+        // Clean up should succeed even with missing PID file
+        cleanup_stale_session(&socket_path, &pid_file_path).unwrap();
+
+        // Verify socket is gone
+        assert!(!socket_path.exists());
+        assert!(!pid_file_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_stale_session_no_files() {
+        use tempfile::tempdir;
+
+        // Test cleanup_stale_session handles no files gracefully
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let pid_file_path = temp_dir.path().join("test.pid");
+
+        // Neither file exists
+        assert!(!socket_path.exists());
+        assert!(!pid_file_path.exists());
+
+        // Clean up should succeed even with no files
+        cleanup_stale_session(&socket_path, &pid_file_path).unwrap();
+
+        // Should still not exist
+        assert!(!socket_path.exists());
+        assert!(!pid_file_path.exists());
+    }
+
+    #[test]
+    fn test_create_pid_file_functionality() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test create_pid_file creates file with correct content
+        let temp_dir = tempdir().unwrap();
+        let pid_file_path = temp_dir.path().join("test.pid");
+        let test_pid = 12345u32;
+
+        // Create PID file
+        create_pid_file(&pid_file_path, test_pid).unwrap();
+
+        // Verify file exists and has correct content
+        assert!(pid_file_path.exists());
+        let content = fs::read_to_string(&pid_file_path).unwrap();
+        assert_eq!(content, "12345");
+
+        // Verify file can be read back by our reader
+        assert_eq!(read_pid_file(&pid_file_path), Some(test_pid));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_pid_file_permissions() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        // Test PID file has correct permissions on Unix
+        let temp_dir = tempdir().unwrap();
+        let pid_file_path = temp_dir.path().join("test.pid");
+        let test_pid = 12345u32;
+
+        // Create PID file
+        create_pid_file(&pid_file_path, test_pid).unwrap();
+
+        // Check permissions (should be 0o600 = owner read/write only)
+        let metadata = fs::metadata(&pid_file_path).unwrap();
+        let permissions = metadata.permissions();
+        assert_eq!(permissions.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn test_create_pid_file_with_nested_directory() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test create_pid_file creates nested directories if they don't exist
+        let temp_dir = tempdir().unwrap();
+        let nested_dir = temp_dir
+            .path()
+            .join("nested")
+            .join("deep")
+            .join("directory");
+        let pid_file_path = nested_dir.join("test.pid");
+        let test_pid = 12345u32;
+
+        // Ensure nested directory doesn't exist initially
+        assert!(!nested_dir.exists());
+
+        // Create PID file - should create directories automatically
+        create_pid_file(&pid_file_path, test_pid).unwrap();
+
+        // Verify directory was created
+        assert!(nested_dir.exists());
+
+        // Verify PID file exists and has correct content
+        assert!(pid_file_path.exists());
+        let content = fs::read_to_string(&pid_file_path).unwrap();
+        assert_eq!(content, "12345");
+    }
+
+    #[test]
+    fn test_create_pid_file_directory_creation_success() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test create_pid_file successfully creates directories when possible
+        let temp_dir = tempdir().unwrap();
+        let nested_path = temp_dir.path().join("some").join("nested").join("path");
+        let pid_file_path = nested_path.join("test.pid");
+        let test_pid = 54321u32;
+
+        // Ensure nested path doesn't exist initially
+        assert!(!nested_path.exists());
+
+        // Create PID file - should create all necessary directories
+        create_pid_file(&pid_file_path, test_pid).unwrap();
+
+        // Verify everything was created correctly
+        assert!(nested_path.exists());
+        assert!(nested_path.is_dir());
+        assert!(pid_file_path.exists());
+
+        let content = fs::read_to_string(&pid_file_path).unwrap();
+        assert_eq!(content, "54321");
+    }
+
+    #[test]
+    fn test_full_session_lifecycle() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test complete session lifecycle: Available -> Active -> Stale -> Cleanup -> Available
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("lifecycle.sock");
+        let pid_file_path = temp_dir.path().join("lifecycle.pid");
+
+        // 1. Initial state should be Available
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::Available
+        );
+
+        // 2. Create active session (socket + running PID)
+        fs::write(&socket_path, "").unwrap();
+        let current_pid = std::process::id();
+        fs::write(&pid_file_path, current_pid.to_string()).unwrap();
+
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::ActiveSession(current_pid)
+        );
+
+        // 3. Simulate process death by changing to stale PID
+        let stale_pid = get_stale_pid();
+        fs::write(&pid_file_path, stale_pid.to_string()).unwrap();
+
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::StaleSession(stale_pid)
+        );
+
+        // 4. Clean up stale session
+        cleanup_stale_session(&socket_path, &pid_file_path).unwrap();
+
+        // 5. Should be Available again
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::Available
+        );
+    }
+
+    #[test]
+    fn test_session_state_transitions_with_edge_cases() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // Test various edge cases in session state transitions
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("edge.sock");
+        let pid_file_path = temp_dir.path().join("edge.pid");
+
+        // Test empty PID file
+        fs::write(&socket_path, "").unwrap();
+        fs::write(&pid_file_path, "").unwrap();
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::OrphanSocket
+        );
+
+        // Test PID file with whitespace
+        fs::write(&pid_file_path, "  12345  \n").unwrap();
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::StaleSession(12345)
+        );
+
+        // Test PID file with invalid characters
+        fs::write(&pid_file_path, "123abc").unwrap();
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::OrphanSocket
+        );
+
+        // Test PID 0 (special case - might be kernel/system process)
+        fs::write(&pid_file_path, "0").unwrap();
+        let state = check_session_state(&socket_path, &pid_file_path);
+        // PID 0 might be ActiveSession (kernel process) or StaleSession depending on OS
+        assert!(
+            matches!(state, SessionState::StaleSession(0))
+                || matches!(state, SessionState::ActiveSession(0)),
+            "PID 0 should be either Active or Stale, got: {:?}",
+            state
+        );
+    }
+
+    #[test]
+    fn test_real_unix_socket_integration() {
+        use tempfile::tempdir;
+        use tokio::net::UnixListener;
+
+        // Create a test that actually binds a Unix socket
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("integration-test.sock");
+        let pid_file_path = temp_dir.path().join("integration-test.pid");
+
+        // Test 1: Available state with no socket
+        assert_eq!(
+            check_session_state(&socket_path, &pid_file_path),
+            SessionState::Available
+        );
+
+        // Test 2: Create a real Unix socket (this will verify filesystem behavior)
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // Bind a real Unix socket
+            let _listener = UnixListener::bind(&socket_path).expect("Failed to bind Unix socket");
+
+            // Verify socket file exists and has correct type
+            assert!(socket_path.exists());
+            let metadata = std::fs::metadata(&socket_path).unwrap();
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                assert!(
+                    metadata.file_type().is_socket(),
+                    "Should be a socket file type"
+                );
+            }
+
+            // Test 3: Without PID file, should be OrphanSocket
+            assert_eq!(
+                check_session_state(&socket_path, &pid_file_path),
+                SessionState::OrphanSocket
+            );
+
+            // Test 4: With PID file, should be ActiveSession or StaleSession
+            let current_pid = std::process::id();
+            std::fs::write(&pid_file_path, current_pid.to_string()).unwrap();
+
+            let state = check_session_state(&socket_path, &pid_file_path);
+            assert!(
+                matches!(state, SessionState::ActiveSession(_)),
+                "Should be ActiveSession with real socket and current PID"
+            );
+
+            // Socket is automatically cleaned up when _listener is dropped
+        });
+
+        // Test 5: After socket is closed, cleanup should work
+        cleanup_stale_session(&socket_path, &pid_file_path).unwrap();
+        assert!(!socket_path.exists());
+        assert!(!pid_file_path.exists());
+    }
+
+    #[test]
+    fn test_process_existence_check_interface() {
+        // Test that the process checking interface works across platforms
+
+        // Test with current process (should exist on all platforms)
+        let current_pid = std::process::id();
+        assert!(is_process_running(current_pid));
+
+        // Test with a PID that's guaranteed not to exist
+        let stale_pid = get_stale_pid();
+        let result = is_process_running(stale_pid);
+
+        // Process should not be running since it exited
+        assert!(!result, "Stale PID should not exist");
     }
 }
